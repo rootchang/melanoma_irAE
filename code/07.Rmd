@@ -1,0 +1,749 @@
+---
+title: "Validating activated CD8Tcm signature in Switzerland cohorts"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+####### This script makes the below displays for the paper
+## Figure 3K-N
+
+# load required package
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(viridis)
+library(tidyr)
+library(pROC)
+library(verification)
+
+library(dplyr)
+library(openxlsx)
+
+library(readr)
+library(survival)
+
+```
+
+# Figure 3K. OR plot for Switzerland 1
+```{r}
+
+cellRatio_df <- read.csv(paste0(result_data_dir, "/automatic_cell_counts_per_sample_TCM_subsets.csv")) 
+pheno_df <- read_xlsx(paste0(result_data_dir, "/irAEs_with_survival.xlsx"))
+allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+
+predictor <- allInfo_df$CD8Tcm.tripletORp / allInfo_df$CD8Tcm
+pheno <- allInfo_df$irAE_treatment_related # any irAE
+pheno[pheno == "yes"] <- 1
+pheno[pheno == "no"] <- 0
+pheno <- as.numeric(pheno)
+
+dataset = "Nico_new1" 
+plot_data = data.frame(phenotype = pheno,
+                       feature = predictor)
+
+cutoff = 0.04 
+phenotype_lower = "any irAE" 
+phenotype_Upper = "Any irAE"
+
+plot_data = na.omit(plot_data)
+print(paste("Sample number: ", nrow(plot_data)))
+
+# Map phenotype labels
+plot_data$phenotype2 <- factor(plot_data$phenotype, levels = c(0, 1),
+                              labels = c(paste0("No ", phenotype_lower), phenotype_Upper))
+# Add a new group variable based on the 5% cutoff
+plot_data$group <- ifelse(plot_data$feature <= cutoff, "Low", "High")
+plot_data$group = factor(plot_data$group, levels = c("Low", "High"))
+
+
+################## barplot ##################
+# Calculate the irAE rates for the two groups
+irAE_rates <- aggregate(phenotype ~ group, data = plot_data, FUN = function(x) mean(as.numeric(x) == 1) * 100)
+
+# Perform chi-square test
+table_data <- table(plot_data$group, plot_data$phenotype2)
+ks_p <- chisq.test(table_data)$p.value
+#formatted_p <- paste0("P = ", signif(ks_p, digits = 2))
+formatted_p <- paste0("OR = ", round(irAE_rates$phenotype[2]/irAE_rates$phenotype[1],1))
+
+# Create the plot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_",dataset,".pdf"))
+fig_width <- 1.5
+fig_height <- 2.3
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+
+ggplot(irAE_rates, aes(x = group, y = phenotype, fill = group)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +  # Barplot
+  labs(x = NULL, y = paste0(phenotype_Upper, " (%)"), title = "") +
+  ylim(0, 100) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(color = "black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  ) +
+  geom_signif(
+    comparisons = list(c("Low", "High")),
+    annotations = formatted_p,
+    textsize = 4,
+    y_position = 90,  # Position of the p-value annotation
+    vjust = -0.5,  # Adjust the vertical position of the text relative to the bracket
+    tip_length = 0.05
+  )
+
+dev.off()
+
+print(paste("Odds ratio: ", irAE_rates$phenotype[2]/irAE_rates$phenotype[1]))
+
+
+```
+
+# Survival plot for Switzerland 1
+```{r}
+
+file_prefix <- "Nico_new1"
+
+cellRatio_df <- read.csv(paste0(result_data_dir, "/automatic_cell_counts_per_sample_TCM_subsets.csv")) 
+pheno_df <- read_xlsx(paste0(result_data_dir, "/irAEs_with_survival.xlsx"))
+allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+predictor <- allInfo_df$CD8Tcm.tripletORp / allInfo_df$CD8Tcm
+
+############# Survival test for OS / PFS / time-irAEmax
+exp_cutoff_method <- "abs" 
+phenotype_str <- "OS" 
+y_label_str <- "Overall \nsurvival probability" 
+
+OS_time <- allInfo_df$OS_time/30
+OS_event <- allInfo_df$OS_event
+Tox <- allInfo_df$irAE_treatment_related
+
+Score_Pred = predictor
+Score=Score_Pred
+if (exp_cutoff_method == "quantile"){
+  exp_cutoff = quantile(Score_Pred, 0.5)
+}else if (exp_cutoff_method == "abs"){
+  exp_cutoff = 0.04
+}
+#exp_cutoff = 0.04
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+cancerData=data.frame(Score,OS_time,OS_event) # , Tox
+colnames(cancerData) = c("Score","OS_time","OS_event") # ,"Tox"
+cancerData <- na.omit(cancerData)
+
+sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+scox_coef = summary(scox)$coefficients
+HR_value = scox_coef[2] # hazard ratio
+Z_value=scox_coef[4]
+P_value=scox_coef[5]
+HR_CI = summary(scox)$conf.int[3:4]
+
+##### plot
+fontSize = 12
+survp=ggsurvplot(
+  sfit,
+  data = cancerData,
+  size = 1,                 # change line size
+  palette =
+    c("#00305d", "#9c1915"),# custom color palettes
+  conf.int = FALSE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  xlim = c(-3,70),
+  ylim=c(0,1),
+  xlab = "Time (months)", ylab= y_label_str,# 
+  break.time.by = 10,
+  risk.table=TRUE,
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  risk.table.pos="out",
+  risk.table.col="black",
+  risk.table.y.text = FALSE,
+  tables.y.text = FALSE, 
+  tables.theme = theme_cleantable(),
+  legend.labs =c("Low", "High"),    # Change legend labels
+  legend.title="",
+  legend = c(0.75, 0.975), # legend relative position
+  font.main = c(fontSize),
+  font.caption = c(fontSize),
+  font.legend = c(fontSize),
+  font.tickslab = c(fontSize),
+  font.x = c(fontSize),
+  font.y = c(fontSize),
+  ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                 plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                 panel.background = element_rect(fill = "white"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                 axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+) 
+survp$plot = survp$plot+ 
+            ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+pdf(paste0(result_figure_dir, "KM_curve_",phenotype_str,"_",feature_test,"_Nico_new.pdf"),width=3.3, height=3)
+print(survp, newpage = FALSE)
+dev.off()
+
+```
+
+# Figure 3L. OR plot for Switzerland 2
+```{r}
+
+cellRatio_df <- read.csv(paste0(result_data_dir, "/automatic_cell_counts_per_sample_TCM_subsets_cohort1.csv")) 
+
+pheno_df <- read_excel(paste0(result_data_dir, "/updated_metadata_new.xlsx"))
+allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+predictor <- allInfo_df$CD8Tcm.tripletORp / allInfo_df$CD8Tcm
+
+# 1. ROC for severe irAE
+pheno1 <- allInfo_df$severe_irAE  
+dataset = "Fernando1" 
+plot_data = data.frame(phenotype = pheno1,
+                       feature = predictor)
+
+cutoff = 0.04
+phenotype_lower = "severe irAE" 
+phenotype_Upper = "Severe irAE" 
+
+plot_data = na.omit(plot_data)
+print(paste("Sample number: ", nrow(plot_data)))
+
+# Map phenotype labels
+plot_data$phenotype2 <- factor(plot_data$phenotype, levels = c(0, 1),
+                              labels = c(paste0("No ", phenotype_lower), phenotype_Upper))
+# Add a new group variable based on the 5% cutoff
+plot_data$group <- ifelse(plot_data$feature <= cutoff, "Low", "High")
+plot_data$group = factor(plot_data$group, levels = c("Low", "High"))
+
+
+################## barplot ##################
+# Calculate the irAE rates for the two groups
+irAE_rates <- aggregate(phenotype ~ group, data = plot_data, FUN = function(x) mean(as.numeric(x) == 1) * 100)
+
+# Perform chi-square test
+table_data <- table(plot_data$group, plot_data$phenotype2)
+ks_p <- chisq.test(table_data)$p.value
+#formatted_p <- paste0("P = ", signif(ks_p, digits = 2))
+formatted_p <- paste0("OR = ", round(irAE_rates$phenotype[2]/irAE_rates$phenotype[1],1))
+
+# Create the plot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_",dataset,".pdf"))
+fig_width <- 1.5
+fig_height <- 2.3
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+
+ggplot(irAE_rates, aes(x = group, y = phenotype, fill = group)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +  # Barplot
+  labs(x = NULL, y = paste0(phenotype_Upper, " (%)"), title = "") +
+  ylim(0, 100) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(color = "black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  ) +
+  geom_signif(
+    comparisons = list(c("Low", "High")),
+    annotations = formatted_p,
+    textsize = 4,
+    y_position = 90,  # Position of the p-value annotation
+    vjust = -0.5,  # Adjust the vertical position of the text relative to the bracket
+    tip_length = 0.05
+  )
+
+dev.off()
+
+print(paste("Odds ratio: ", irAE_rates$phenotype[2]/irAE_rates$phenotype[1]))
+
+
+```
+
+# Survival plot for Switzerland 2
+```{r}
+
+exp_cutoff_method <- "abs"
+phenotype_str <- "OS" 
+y_label_str <- "Overall \nsurvival probability" 
+
+cellRatio_df <- read.csv(paste0(result_data_dir, "/automatic_cell_counts_per_sample_TCM_subsets_cohort1.csv")) 
+pheno_df <- read_excel(paste0(result_data_dir, "/updated_metadata_new.xlsx"))
+survival_df <- read_excel(paste0(result_data_dir, "/2025_06_18_Co1 & Co2 IT_pfs_os_for Nico.xlsx"))
+
+
+allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+allInfo_df <- merge(allInfo_df, survival_df, by = "patient_id")
+allInfo_df$PFS_event <- ifelse(allInfo_df$progression, 1, 0)
+allInfo_df$OS_event <- ifelse(allInfo_df$dead, 1, 0)
+allInfo_df$PFS_time <- allInfo_df$`PFS (days)`/30
+allInfo_df$OS_time <- allInfo_df$OS/30
+
+predictor <- allInfo_df$CD8Tcm.tripletORp / allInfo_df$CD8Tcm
+
+
+Score_Pred <- predictor
+Score=Score_Pred
+if (exp_cutoff_method == "quantile"){
+  exp_cutoff = quantile(Score_Pred, 0.5)
+}else if (exp_cutoff_method == "abs"){
+  exp_cutoff = 0.04
+}
+
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+cancerData=data.frame(Score,allInfo_df[[paste0(phenotype_str, "_time")]],allInfo_df[[paste0(phenotype_str, "_event")]])
+colnames(cancerData) = c("Score","OS_time","OS_event")
+
+sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+scox_coef = summary(scox)$coefficients
+HR_value = scox_coef[2] # hazard ratio
+Z_value=scox_coef[4]
+P_value=scox_coef[5]
+HR_CI = summary(scox)$conf.int[3:4]
+
+##### plot
+fontSize = 12
+survp=ggsurvplot(
+  sfit,
+  data = cancerData,
+  size = 1,                 # change line size
+  palette =
+    c("#00305d", "#9c1915"),# custom color palettes
+  conf.int = FALSE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  xlim = c(-3,70),
+  ylim=c(0,1),
+  xlab = "Time (months)", ylab= y_label_str,# 
+  break.time.by = 10,
+  risk.table=TRUE,
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  risk.table.pos="out",
+  risk.table.col="black",
+  risk.table.y.text = FALSE,
+  tables.y.text = FALSE, 
+  tables.theme = theme_cleantable(),
+  legend.labs =c("Low", "High"),    # Change legend labels
+  legend.title="",
+  legend = c(0.75, 0.975), # legend relative position
+  font.main = c(fontSize),
+  font.caption = c(fontSize),
+  font.legend = c(fontSize),
+  font.tickslab = c(fontSize),
+  font.x = c(fontSize),
+  font.y = c(fontSize),
+  ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                 plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                 panel.background = element_rect(fill = "white"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                 axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+) 
+survp$plot = survp$plot+ 
+            ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+pdf(paste0(result_figure_dir, "KM_curve_",phenotype_str,"_",feature_test,"_Fernando1.pdf"),width=3.3, height=3)
+print(survp, newpage = FALSE)
+dev.off()
+
+```
+
+
+# Figure 3M. OR plot for Switzerland 3
+```{r}
+
+cellRatio_df <- read.csv(paste0(result_data_dir, "/automatic_cell_counts_per_sample_TCM_subsets_cohort2.csv")) 
+pheno_df <- read_excel(paste0(result_data_dir, "/updated_metadata_new.xlsx"))
+pheno_df <- pheno_df[!grepl("CTLA4", pheno_df$treatment), ]
+allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+predictor <- allInfo_df$CD8Tcm.tripletORp / allInfo_df$CD8Tcm
+pheno1 <- allInfo_df$severe_irAE  # Binary outcome (0/1)
+
+dataset = "Fernando2" 
+plot_data = data.frame(phenotype = pheno1,
+                       feature = predictor)
+
+cutoff = 0.04 
+phenotype_lower = "severe irAE" 
+phenotype_Upper = "Severe irAE"
+
+plot_data = na.omit(plot_data)
+print(paste("Sample number: ", nrow(plot_data)))
+
+# Map phenotype labels
+plot_data$phenotype2 <- factor(plot_data$phenotype, levels = c(0, 1),
+                              labels = c(paste0("No ", phenotype_lower), phenotype_Upper))
+# Add a new group variable based on the 5% cutoff
+plot_data$group <- ifelse(plot_data$feature <= cutoff, "Low", "High")
+plot_data$group = factor(plot_data$group, levels = c("Low", "High"))
+
+
+################## barplot ##################
+# Calculate the irAE rates for the two groups
+irAE_rates <- aggregate(phenotype ~ group, data = plot_data, FUN = function(x) mean(as.numeric(x) == 1) * 100)
+
+# Perform chi-square test
+table_data <- table(plot_data$group, plot_data$phenotype2)
+ks_p <- chisq.test(table_data)$p.value
+#formatted_p <- paste0("P = ", signif(ks_p, digits = 2))
+formatted_p <- paste0("OR = ", round(irAE_rates$phenotype[2]/irAE_rates$phenotype[1],1))
+
+# Create the plot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_",dataset,".pdf"))
+fig_width <- 1.5
+fig_height <- 2.3
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+
+ggplot(irAE_rates, aes(x = group, y = phenotype, fill = group)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +  # Barplot
+  labs(x = NULL, y = paste0(phenotype_Upper, " (%)"), title = "") +
+  ylim(0, 100) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(color = "black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  ) +
+  geom_signif(
+    comparisons = list(c("Low", "High")),
+    annotations = formatted_p,
+    textsize = 4,
+    y_position = 90,  # Position of the p-value annotation
+    vjust = -0.5,  # Adjust the vertical position of the text relative to the bracket
+    tip_length = 0.05
+  )
+
+dev.off()
+
+print(paste("Odds ratio: ", irAE_rates$phenotype[2]/irAE_rates$phenotype[1]))
+
+
+```
+
+# Survival plot for Switzerland 3
+```{r}
+
+exp_cutoff_method <- "abs" 
+phenotype_str <- "OS" 
+y_label_str <- "Overall \nsurvival probability" 
+cellRatio_df <- read.csv(paste0(result_data_dir, "/automatic_cell_counts_per_sample_TCM_subsets_cohort2.csv")) 
+pheno_df <- read_excel(paste0(result_data_dir, "/updated_metadata_new.xlsx"))
+
+survival_df <- read_excel(paste0(result_data_dir, "/2025_06_18_Co1 & Co2 IT_pfs_os_for Nico.xlsx"))
+
+
+allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+allInfo_df <- merge(allInfo_df, survival_df, by = "patient_id")
+allInfo_df$PFS_event <- ifelse(allInfo_df$progression, 1, 0)
+allInfo_df$OS_event <- ifelse(allInfo_df$dead, 1, 0)
+allInfo_df$PFS_time <- allInfo_df$`PFS (days)`/30
+allInfo_df$OS_time <- allInfo_df$OS/30
+allInfo_df <- allInfo_df[!grepl("CTLA4", allInfo_df$treatment), ]
+
+predictor <- allInfo_df$CD8Tcm.tripletORp / allInfo_df$CD8Tcm
+
+Score_Pred <- predictor
+Score=Score_Pred
+if (exp_cutoff_method == "quantile"){
+  exp_cutoff = quantile(Score_Pred, 0.5)
+}else if (exp_cutoff_method == "abs"){
+  exp_cutoff = 0.04
+}
+
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+cancerData=data.frame(Score,allInfo_df[[paste0(phenotype_str, "_time")]],allInfo_df[[paste0(phenotype_str, "_event")]])
+colnames(cancerData) = c("Score","OS_time","OS_event")
+
+sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+scox_coef = summary(scox)$coefficients
+HR_value = scox_coef[2] # hazard ratio
+Z_value=scox_coef[4]
+P_value=scox_coef[5]
+HR_CI = summary(scox)$conf.int[3:4]
+
+##### plot
+fontSize = 12
+survp=ggsurvplot(
+  sfit,
+  data = cancerData,
+  size = 1,                 # change line size
+  palette =
+    c("#00305d", "#9c1915"),# custom color palettes
+  conf.int = FALSE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  xlim = c(-3,70),
+  ylim=c(0,1),
+  xlab = "Time (months)", ylab= y_label_str,# 
+  break.time.by = 10,
+  risk.table=TRUE,
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  risk.table.pos="out",
+  risk.table.col="black",
+  risk.table.y.text = FALSE,
+  tables.y.text = FALSE, 
+  tables.theme = theme_cleantable(),
+  legend.labs =c("Low", "High"),    # Change legend labels
+  legend.title="",
+  legend = c(0.75, 0.975), # legend relative position
+  font.main = c(fontSize),
+  font.caption = c(fontSize),
+  font.legend = c(fontSize),
+  font.tickslab = c(fontSize),
+  font.x = c(fontSize),
+  font.y = c(fontSize),
+  ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                 plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                 panel.background = element_rect(fill = "white"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                 axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+) 
+survp$plot = survp$plot+ 
+            ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+pdf(paste0(result_figure_dir, "KM_curve_",phenotype_str,"_",feature_test,"_Fernando2.pdf"),width=3.3, height=3)
+print(survp, newpage = FALSE)
+dev.off()
+
+```
+
+# Prepare data for forest plot of three cohorts and merge of them (OS)
+```{r}
+library(readxl)
+library(survival)
+library(dplyr)
+
+# Initialize result and raw data frames
+result_df <- data.frame(dataset = character(),
+                        HR = numeric(),
+                        HR_low = numeric(),
+                        HR_up = numeric(),
+                        pval = numeric(),
+                        stringsAsFactors = FALSE)
+
+raw_data_df <- data.frame(predictor = numeric(),
+                          OS_time = numeric(),
+                          OS_event = numeric(),
+                          stringsAsFactors = FALSE)
+
+# ----------- FUNCTION DEFINITIONS -----------
+
+process_cohort <- function(cohort_name,
+                           cell_file,
+                           pheno_file,
+                           survival_file = NULL,
+                           root_dir,
+                           predictor_formula,
+                           phenotype_str = "OS",
+                           exp_cutoff_method = "abs",
+                           exp_cutoff_value = 0.04,
+                           filter_CTLA4 = FALSE) {
+
+  # Read data
+  cellRatio_df <- read.csv(file.path(root_dir, cell_file))
+  pheno_df <- read_excel(file.path(root_dir, pheno_file))
+  
+  # Optional filtering
+  if (filter_CTLA4) {
+    pheno_df <- pheno_df[!grepl("CTLA4", pheno_df$treatment), ]
+  }
+
+  # Merge phenotype
+  allInfo_df <- merge(cellRatio_df, pheno_df, by = "sample_id")
+
+  # Merge survival data if provided
+  if (!is.null(survival_file)) {
+    survival_df <- read_excel(file.path(root_dir, survival_file))
+    allInfo_df <- merge(allInfo_df, survival_df, by = "patient_id")
+    allInfo_df$PFS_event <- as.integer(allInfo_df$progression)
+    allInfo_df$OS_event <- as.integer(allInfo_df$dead)
+    allInfo_df$PFS_time <- allInfo_df$`PFS (days)` / 30
+    allInfo_df$OS_time <- allInfo_df$OS / 30
+  } else {
+    allInfo_df$OS_time <- allInfo_df$OS_time / 30
+  }
+
+  # Define predictor
+  predictor <- with(allInfo_df, eval(parse(text = predictor_formula)))
+
+  # Cutoff logic
+  Score <- if (exp_cutoff_method == "quantile") {
+    factor(ifelse(predictor > quantile(predictor, 0.5), "High", "Low"))
+  } else {
+    factor(ifelse(predictor > exp_cutoff_value, "High", "Low"))
+  }
+
+  Score <- relevel(Score, ref = "Low")
+
+  # Setup survival data
+  time_col <- paste0(phenotype_str, "_time")
+  event_col <- paste0(phenotype_str, "_event")
+  cancerData <- data.frame(Score = Score,
+                           OS_time = allInfo_df[[time_col]],
+                           OS_event = allInfo_df[[event_col]])
+
+  cancerData <- na.omit(cancerData)
+
+  # Cox PH model
+  scox <- coxph(Surv(OS_time, OS_event) ~ Score, data = cancerData)
+  scox_coef <- summary(scox)$coefficients
+  HR_CI <- summary(scox)$conf.int[3:4]
+
+  # Append to result and raw data
+  result_row <- data.frame(dataset = cohort_name,
+                           HR = scox_coef[2],
+                           HR_low = HR_CI[1],
+                           HR_up = HR_CI[2],
+                           pval = scox_coef[5])
+
+  raw_data_df <<- rbind(raw_data_df, cancerData)
+  result_df <<- rbind(result_df, result_row)
+
+  print(paste0(cohort_name, ": HR = ", round(scox_coef[2], 2), 
+               ", p = ", signif(scox_coef[5], 3)))
+  
+  write.csv(allInfo_df, paste0(root_dir, cohort_name, "_clinical_info.csv"))
+}
+
+# ----------- RUN EACH COHORT -----------
+
+root_dir_1 <- "/Users/changt7/Documents/00.PostDocWork/CancerResearch/01.Projects/00.Collaborating_projects/10.UUtahPIVOTCenter_Siwen/02.Input/Nicolas_Mitch_Zurich/raw_data_Nicolas/"
+process_cohort(cohort_name = "Switzerland 1",
+               cell_file = "automatic_cell_counts_per_sample_TCM_subsets.csv",
+               pheno_file = "irAEs_with_survival.xlsx",
+               root_dir = root_dir_1,
+               predictor_formula = "CD8Tcm.tripletORp / CD8Tcm")
+
+root_dir_2 <- "/Users/changt7/Documents/00.PostDocWork/CancerResearch/01.Projects/00.Collaborating_projects/10.UUtahPIVOTCenter_Siwen/02.Input/Nicolas_Mitch_Zurich/raw_data_Fernando_updated/"
+process_cohort(cohort_name = "Switzerland 2",
+               cell_file = "automatic_cell_counts_per_sample_TCM_subsets_cohort1.csv",
+               pheno_file = "updated_metadata_new.xlsx",
+               survival_file = "2025_06_18_Co1 & Co2 IT_pfs_os_for Nico.xlsx",
+               root_dir = root_dir_2,
+               exp_cutoff_method = "quantile",
+               predictor_formula = "CD8Tcm.tripletORp / CD8Tcm")
+
+process_cohort(cohort_name = "Switzerland 3",
+               cell_file = "automatic_cell_counts_per_sample_TCM_subsets_cohort2.csv",
+               pheno_file = "updated_metadata_new.xlsx",
+               survival_file = "2025_06_18_Co1 & Co2 IT_pfs_os_for Nico.xlsx",
+               root_dir = root_dir_2,
+               predictor_formula = "CD8Tcm.tripletORp / CD8Tcm",
+               filter_CTLA4 = TRUE)
+
+# ----------- RESULT OUTPUT -----------
+# Cox PH model
+scox <- coxph(Surv(OS_time, OS_event) ~ Score, data = raw_data_df)
+scox_coef <- summary(scox)$coefficients
+HR_CI <- summary(scox)$conf.int[3:4]
+
+# Append to result and raw data
+result_row <- data.frame(dataset = "Merged",
+                         HR = scox_coef[2],
+                         HR_low = HR_CI[1],
+                         HR_up = HR_CI[2],
+                         pval = scox_coef[5])
+
+result_df <- rbind(result_df, result_row)
+
+```
+
+# Figure 3N. Forest plot
+```{r}
+library(forestplot)
+
+######### forest plot of OS HR and p-value
+plot_data <- tibble::tibble(mean  = result_df[["HR"]],
+                            lower = result_df[["HR_low"]],
+                            upper = result_df[["HR_up"]],
+                            Variable = result_df$dataset,
+                            effSize = round(result_df[["HR"]],3),
+                            pval = result_df[["pval"]])
+
+options(scipen = 999)
+P_value_raw = plot_data[['pval']]
+
+pval_vec = vector("character", length(P_value_raw))
+for (i in 1:length(P_value_raw)){
+  pval = P_value_raw[i]
+  if (pval>=0.05){
+    pval_vec[i] = as.character(round(pval,2))
+  }else if (pval>=0.0095){
+    pval_vec[i] = as.character(round(pval,3))
+  }else{
+    pval_vec[i] = format(pval, scientific = TRUE, digits = 2)  # Format for scientific notation
+  }
+}
+plot_data$pval = pval_vec
+
+xmin_lim = 0
+xmax_lim = 4
+breaks_x = c(0,1,2,3)
+labels_x = breaks_x
+
+
+pdf_file <- paste0(result_figure_dir,paste0("Forest_Switzerland_cohorts_actCD8Tcm_OS.pdf"))
+fig_width = 5.5
+fig_height = 3.6
+fontSize = 1.2
+xlabel = "HR of OS"
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+plot_data %>%
+  forestplot(labeltext = c("effSize", "Variable", "pval"),
+             graph.pos = 3,
+             boxsize = 0.35,
+             vertices = TRUE,
+             clip = c(xmin_lim, xmax_lim),
+             xlog = FALSE,
+             zero = 1, # dashed line position
+             txt_gp = fpTxtGp(ticks=gpar(cex=fontSize),xlab=gpar(cex=fontSize),label=gpar(cex=fontSize),legend=gpar(cex=fontSize),title=gpar(cex=fontSize)), 
+             xlab = xlabel, # Kaplan-Meier   Multivariable
+             xticks = breaks_x,
+             graphwidth = unit(3, "cm"),
+             lineheight = unit(2, "cm")
+             ) %>%
+  fp_set_style(box = "black",
+               line = "black",
+               align = "llr", # hrz_lines = "#999999"
+               summary = "black") %>%
+  fp_add_header(effSize = c("HR")|> fp_txt_plain() |> fp_align_left(),
+                Variable = c("Cohort")|> fp_txt_plain() |> fp_align_left(),
+                pval = c("P-value")|> fp_txt_plain() |> fp_align_right())
+
+dev.off()
+
+```
+
+
+

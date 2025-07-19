@@ -1,0 +1,1377 @@
+---
+title: "Predict severe irAEs with blood cytometric and protemic data"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+```
+
+
+####### This script makes the below displays for the paper
+## Figure 2A-J
+## Figure 4A-C,G
+## SFigure 2A-B
+## SFigure 3A-B
+## SFigure 5A-G
+## STable 6
+
+# load required package
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(viridis)
+library(tidyr)
+library(pROC)
+library(verification)
+library(reshape2)
+library(ggpubr)
+
+library(dplyr)
+library(survival)
+library(survminer)
+
+library(ggrepel) 
+library(glmnet)
+library(caret)
+library(pROC)
+library(ranger)
+library(readr)
+
+library(AnnotationDbi)
+library(org.Hs.eg.db) 
+library(ReactomePA)
+library(enrichplot)
+library(gridExtra)
+library(clusterProfiler)
+library(msigdbr)
+
+library(VennDiagram)
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(WGCNA)
+library(corrr)
+
+library(RColorBrewer)
+library(msigdbr)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+
+```
+
+# common functions and parameters
+```{r}
+
+# function mapping gene IDs and Symbols
+convert_gene_ids_to_symbols <- function(gene_ids, mapping) {
+  lapply(gene_ids, function(x) {
+    entrez_ids <- unlist(strsplit(x, "/"))
+    gene_symbols <- names(mapping)[match(entrez_ids, mapping)]
+    paste(gene_symbols, collapse = ", ")
+  })
+}
+
+# Create a function to make olink gene names unique
+make_unique <- function(names) {
+  # Initialize an empty vector to store unique names
+  unique_names <- character(length(names))
+  # Create a named vector to count occurrences
+  name_count <- table(names)
+  # Track the current count of each name
+  name_tracker <- setNames(rep(0, length(name_count)), names(name_count))
+  # Iterate over the names and create unique ones
+  for (i in seq_along(names)) {
+    name <- names[i]
+    # If this name is duplicated, append the appropriate number
+    if (name_tracker[name] > 0) {
+      new_name <- paste0(name, "_", name_tracker[name] + 1)
+    } else {
+      new_name <- name
+    }
+    # Assign the unique name
+    unique_names[i] <- new_name
+    # Increment the tracker for this name
+    name_tracker[name] <- name_tracker[name] + 1
+  }
+  return(unique_names)
+}
+
+convert_label_genes <- function(label_genes) {
+  label_genes_show <- sapply(label_genes, function(x) {
+    parts <- unlist(strsplit(x, " > "))
+    part1 <- gsub("_", "", parts[1])
+    if (!(grepl("neg$", parts[2]))){
+      part2 <- paste0(gsub("_", "+", parts[2]), "+")
+    }else{
+      part2 <- paste0(gsub("_", "+", parts[2]))
+    }
+    
+    paste(part2, part1)
+  })
+  label_genes_show <- gsub("^NA\\+\\s*", "", label_genes_show)
+  label_genes_show <- gsub("neg", "-", label_genes_show)
+  label_genes_show <- gsub("TCM", "Tcm", label_genes_show)
+  label_genes_show <- gsub("TEMRA", "Temra", label_genes_show)
+  label_genes_show <- gsub("TEM", "Tem", label_genes_show)
+  label_genes_show <- gsub("NAIVE", "naive", label_genes_show)
+  label_genes_show <- gsub("TFH", "Tfh", label_genes_show)
+  label_genes_show <- gsub("MONO", "Mono", label_genes_show)
+  label_genes_show <- gsub("TSCM", "Tscm", label_genes_show)
+  label_genes_show <- gsub("TREG", "Treg", label_genes_show)
+  label_genes_show <- gsub("BREG", "Breg", label_genes_show)
+  return(label_genes_show)
+}
+
+
+# Define the Venn plot function
+plot_venn_three_sets <- function(vec1, vec2, vec3, fig_name) {
+  # Create named list
+  venn_list <- list(
+    AUC = vec1,
+    `Odds ratio`  = vec2,
+    `Fold Change`  = vec3
+  )
+  # Generate Venn plot object
+  venn.plot <- venn.diagram(
+    x = venn_list,
+    filename = NULL,            # Create object, not file
+    output = TRUE,
+    log.filename = NULL,        # Suppresses .log file creation
+    imagetype = "pdf",
+    #height = 3000,
+    #width = 3000,
+    #resolution = 500,
+    compression = "lzw",
+    fill = c("#E41A1C", "#377EB8", "#4DAF4A"),
+    alpha = 0.5,
+    cat.names = NULL,    # No names
+    cat.cex = 0,              # No category text size cat.cex = 1.5,
+    cat.pos = 0,              # No label position
+    cex = 1.5,
+    fontfamily = "sans",
+    #fontface = "bold",
+    cat.fontfamily = "sans",
+    #cat.fontface = "bold",
+    cat.dist = 0.05
+  )
+  # Save to PDF
+  pdf(file = fig_name, width = 3.5, height = 3.5)
+  grid.draw(venn.plot)
+  dev.off()
+}
+
+
+# Function to create multiple box plots comparing cell abundance in irAE vs non-irAE patients
+plot_cell_boxplots <- function(df, cell_pattern, cell_display_name, ymax = 2, ylabel_height = 1.7, ytickstep = 0.5, labeltextadd = 0.25, phenotype = "Severe irAE") {
+  if (phenotype == "Severe irAE"){
+    plot_df <- data.frame(
+      Pre = df[[paste0(cell_pattern, "baseline")]]/100,
+      On = df[[paste0(cell_pattern, "ontreat")]]/100,
+      FC = df[[paste0(cell_pattern, "FC_on_pre")]],
+      IRAE = factor(df$IRAEactionable01)
+    ) %>% melt(id.vars = "IRAE", variable.name = "Group", value.name = "Value")
+  }else if (phenotype == "Response"){
+    plot_df <- data.frame(
+      Pre = df[[paste0(cell_pattern, "baseline")]]/100,
+      On = df[[paste0(cell_pattern, "ontreat")]]/100,
+      FC = df[[paste0(cell_pattern, "FC_on_pre")]],
+      IRAE = factor(df$Response01)
+    ) %>% melt(id.vars = "IRAE", variable.name = "Group", value.name = "Value")
+  }
+  
+  plot_df <- na.omit(plot_df)
+  
+  # Ensure the x-axis factor is properly ordered
+  plot_df <- plot_df %>%
+    mutate(
+      Group = factor(Group, levels = c("Pre", "On", "FC")),
+      Combo = interaction(Group, IRAE, sep = "."),
+      Combo = factor(Combo, levels = c("Pre.0", "Pre.1", "On.0", "On.1", "FC.0", "FC.1")),
+      x_pos = as.numeric(Combo)  # numeric x-axis for positioning
+    )
+  # Define comparisons for p-values
+  comparisons <- list(c("Pre.0", "Pre.1"), c("On.0", "On.1"), c("FC.0", "FC.1"))
+  
+  # Function to convert p-value to symbol
+  p_to_symbol <- function(p) {
+    if (is.na(p)) return("ns")
+    if (p < 0.001) return("***")
+    else if (p < 0.01) return("**")
+    else if (p < 0.05) return("*")
+    else return("ns")
+  }
+  
+  # Calculate p-values and significance symbols
+  pvals <- sapply(comparisons, function(pair) {
+    data1 <- plot_df$Value[plot_df$Combo == pair[1]]
+    data2 <- plot_df$Value[plot_df$Combo == pair[2]]
+    if (length(data1) > 0 && length(data2) > 0) {
+      tryCatch(
+        wilcox.test(data1, data2)$p.value,
+        error = function(e) NA
+      )
+    } else {
+      NA
+    }
+  })
+  significance_labels <- sapply(pvals, p_to_symbol)
+  
+  # Now plot
+  p <- ggplot(plot_df, aes(x = x_pos, y = Value, fill = IRAE, group = Combo)) + # x_pos Combo
+    geom_jitter(width = 0.15, size = 0.5, alpha = 0.7) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    scale_x_continuous(
+      breaks = c(1.5, 3.5, 5.5),              # middle of each group (two bars)
+      labels = c("Pre", "On", "FC"), # c("Pre-treatment", "On-treatment", "Fold change")
+      expand = expansion(add = 0.4)
+    ) +
+    scale_fill_manual(values = c("0" = "#4E79A7", "1" = "#F28E2B"), name = phenotype, labels = c("No", "Yes")) +
+    #scale_x_discrete(labels = rep(c("Pre", "On", "FC"), each = 2)) +
+    labs(title = cell_display_name, x = "", y = "", fill = "IRAE") + # y = "Cell abundance or fold change"
+    coord_cartesian(ylim = c(0, ymax)) +
+    scale_y_sqrt(breaks = seq(0, ymax, by = ytickstep)) +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(size = 9, hjust = 0.5),
+          axis.text = element_text(color = "black"))
+  
+  # X-axis positions of the Combo levels
+  comparison_pairs <- list(c(1, 2), c(3, 4), c(5, 6))
+  
+  # Add fixed-height significance bars with uniform tick length
+  y_sig <- ylabel_height
+  tick_len <- 0.04
+  
+  for (i in seq_along(comparison_pairs)) {
+    pair <- comparison_pairs[[i]]
+    p <- p +
+      annotate("segment", x = pair[1], xend = pair[2], y = y_sig, yend = y_sig, size = 0.5) +  # horizontal bar
+      annotate("segment", x = pair[1], xend = pair[1], y = y_sig, yend = y_sig - tick_len, size = 0.4) +  # left tick
+      annotate("segment", x = pair[2], xend = pair[2], y = y_sig, yend = y_sig - tick_len, size = 0.4) +  # right tick
+      annotate("text", x = mean(pair), y = y_sig + labeltextadd, label = significance_labels[i]) # , size = 4
+  }
+  return(p)
+}
+
+```
+
+# load data 
+```{r}
+### load HCI002 data
+HCI002_all_info <- read_csv(file = paste0(data_dir, "HCI002_all_info_20241008.csv"), name_repair = "minimal") 
+HCI002_map_df = read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+
+### load HCI001 data
+HCI001_all_info <- read_csv(file = paste0("../02.Input/Siwen_mainCohort/HCI001/", "HCI001_flow_olink_all_info_flat_20241008.csv"), name_repair = "minimal") 
+HCI001_map_df = read.csv(file = paste0("../02.Input/Siwen_mainCohort/HCI001/", "OlinkID_ProteinName_map.csv"))
+
+```
+
+# Figure 2A-D/SFigures 2A-B,3A-B. Comparison of major cell abundance (pre, on, FC) between severe vs non-sereve irAE patients (in HCI002)
+```{r}
+
+phenotype_grouping <- "Response01" # IRAEactionable01 Response01
+
+############################## (ordered cell types) ##############################
+# major_cell_names <- c("^CD8_T_", "^CD8_TNAIVE_", "^CD8_TCM_", "^CD4_TEMRA_", "^CD4_TFH_", "^NKT_", 
+#                       "^T_CELL_", "^B_CELL_", "^NK_", "^MONO_", "^DC_", "^BASOPHIL_",
+#                       "^GDT_", "^DNT_", "^DPT_", "^CD4_nonTREG_", "^TREG_", "^CD4_nonTFH_",
+#                       "^CD8_TEM_", "^CD8_TEMRA_", "^CD4_TNAIVE_", "^CD4_TCM_", "^CD4_TEM_" #, "^CD4_TSCM_"
+#                       )
+# major_cell_names_display <- c("CD8T cell", "CD8Tnaive cell", "CD8Tcm cell", "CD4Temra cell", "CD4T cell (FH)", "NKT cell", 
+#                               "T cell", "B cell", "NK cell", "Monocytes", "DC", "Basophil",
+#                               "GDT cell", "DNT cell", "DPT cell", "CD4T cell (non-Treg)", "Treg cell", "CD4T cell (non-FH)",
+#                               "CD8Tem cell", "CD8Temra cell", "CD4Tnaive cell", "CD4Tcm cell", "CD4Tem cell" #, "CD4Tscm cell"
+#                               )
+
+# major_cell_names <- c("^MONO > PDL1_", "^CD8_T > PD1_", "^CD4_TEMRA > PD1_", "^CD4_nonTFH > PD1_", "^NKT > PD1_", "^DPT > PD1_",
+#                       "^B_CELL > PDL1_", "^NK > PD1_", "^MONO > PD1_", "^DC > PDL1_",
+#                       "^GDT > PD1_", "^DNT > PD1_",
+#                       "^CD8_T > PDL1_", "^TREG > PD1_", "^TREG > PDL1_", "^CD4_TFH > PD1_", "^CD4_TFH > PDL1_", "^CD4_nonTFH > PDL1_",
+#                       "^CD8_TNAIVE > PD1_", "^CD8_TCM > PD1_", "^CD8_TEM > PD1_", "^CD8_TEMRA > PD1_", "^CD8_TNAIVE > PDL1_", "^CD8_TCM > PDL1_", "^CD8_TEM > PDL1_", "^CD8_TEMRA > PDL1_",
+#                       "^CD4_TNAIVE > PD1_", "^CD4_TCM > PD1_", "^CD4_TEM > PD1_", "^CD4_TNAIVE > PDL1_", "^CD4_TCM > PDL1_", "^CD4_TEM > PDL1_", "^CD4_TEMRA > PDL1_" #, "^CD4_TSCM > PD1_", "^CD4_TSCM > PDL1_"
+#                       )
+# major_cell_names_display <- c("PDL1+ Monocytes", "PD1+ CD8T cell", "PD1+ CD4Temra cell", "PD1+ CD4T cell (non-FH)", "PD1+ NKT cell", "PD1+ DPT cell",
+#                               "PDL1+ B cell", "PD1+ NK cell", "PD1+ Monocytes", "PDL1+ DC",
+#                       "PD1+ GDT cell", "PD1+ DNT cell",
+#                       "PDL1+ CD8T cell", "PD1+ Treg cell", "PDL1+ Treg cell", "PD1+ CD4T cell (FH)", "PDL1+ CD4T cell (FH)", "PDL1+ CD4T cell (non-FH)",
+#                       "PD1+ CD8Tnaive cell", "PD1+ CD8Tcm cell", "PD1+ CD8Tem cell", "PD1+ CD8Temra cell", "PDL1+ CD8Tnaive cell", "PDL1+ CD8Tcm cell", "PDL1+ CD8Tem cell", "PDL1+ CD8Temra cell",
+#                       "PD1+ CD4Tnaive cell", "PD1+ CD4Tcm cell", "PD1+ CD4Tem cell", "PDL1+ CD4Tnaive cell", "PDL1+ CD4Tcm cell", "PDL1+ CD4Tem cell", "PDL1+ CD4Temra cell" #, "PD1+ CD4Tscm cell", "PDL1+ CD4Tscm cell"
+#                       )
+
+# major_cell_names <- c("^CD8_T > CTLA4_", "^CD8_TCM > CTLA4_", "^CD4_TEMRA > CTLA4_", "^CD4_nonTFH > CTLA4_","^NKT > CTLA4_", "^DPT > CTLA4_",
+#                       "^MONO > CTLA4_", "^DC > CTLA4_",
+#                       "^GDT > CTLA4_", "^DNT > CTLA4_",
+#                       "^TREG > CTLA4_", "^CD4_TFH > CTLA4_",
+#                       "^CD8_TNAIVE > CTLA4_", "^CD8_TEM > CTLA4_", "^CD8_TEMRA > CTLA4_",
+#                       "^CD4_TNAIVE > CTLA4_", "^CD4_TCM > CTLA4_", "^CD4_TEM > CTLA4_"#, "^CD4_TSCM > CTLA4_"
+#                       )
+# major_cell_names_display <- c("CTLA4+ CD8T cell", "CTLA4+ CD8Tcm cell", "CTLA4+ CD4Temra cell", "CTLA4+ CD4T cell (non-FH)", "CTLA4+ NKT cell", "CTLA4+ DPT cell",
+#                               "CTLA4+ Monocytes", "CTLA4+ DC",
+#                       "CTLA4+ GDT cell", "CTLA4+ DNT cell", 
+#                       "CTLA4+ Treg cell", "CTLA4+ CD4T cell (FH)",
+#                       "CTLA4+ CD8Tnaive cell", "CTLA4+ CD8Tem cell", "CTLA4+ CD8Temra cell",
+#                       "CTLA4+ CD4Tnaive cell", "CTLA4+ CD4Tcm cell", "CTLA4+ CD4Tem cell"#, "CTLA4+ CD4Tscm cell"
+#                       )
+
+# major_cell_names <- c("^MONO > KI67_", "^CD8_T > KI67_", "^CD8_TCM > KI67_", "^CD4_nonTFH > KI67_", "^TREG > KI67_", "^NKT > KI67_", 
+#                       "^B_CELL > KI67_", "^NK > KI67_", "^CD4_TEMRA > KI67_", "^DPT > KI67_", "^DC > KI67_", "^GDT > KI67_", "^DNT > KI67_",
+#                       "^CD4_TFH > KI67_",  # "^CD4_nonTREG > KI67_",
+#                       "^CD8_TNAIVE > KI67_", "^CD8_TEM > KI67_", "^CD8_TEMRA > KI67_",
+#                       "^CD4_TNAIVE > KI67_", "^CD4_TCM > KI67_", "^CD4_TEM > KI67_"#, "^CD4_TSCM > KI67_"
+#                       )
+# major_cell_names_display <- c("KI67+ Monocytes", "KI67+ CD8T cell", "KI67+ CD8Tcm cell", "KI67+ CD4T cell (non-FH)", "KI67+ Treg cell", "KI67+ NKT cell", 
+#                               "KI67+ B cell", "KI67+ NK cell", "KI67+ CD4Temra cell", "KI67+ DPT cell", "KI67+ DC", "KI67+ GDT cell", "KI67+ DNT cell", 
+#                       "KI67+ CD4T cell (FH)",  # "KI67+ CD4T cell (non-Treg)",
+#                       "KI67+ CD8Tnaive cell", "KI67+ CD8Tem cell", "KI67+ CD8Temra cell",
+#                       "KI67+ CD4Tnaive cell", "KI67+ CD4Tcm cell", "KI67+ CD4Tem cell"#, "KI67+ CD4Tscm cell"
+#                       )
+
+major_cell_names <- c("^MONO > KI67_", "^CD8_T > KI67_", "^CD8_TCM > KI67_", "^CD4_nonTFH > KI67_", "^TREG > KI67_", "^NKT > KI67_",
+                      "^B_CELL > KI67_", "^NK > KI67_", "^CD4_TEMRA > KI67_", "^DPT > KI67_", "^DC > KI67_", "^GDT > KI67_", "^DNT > KI67_",
+                      "^CD4_TFH > KI67_",  # "^CD4_nonTREG > KI67_",
+                      "^CD8_TNAIVE > KI67_", "^CD8_TEM > KI67_", "^CD8_TEMRA > KI67_",
+                      "^CD4_TNAIVE > KI67_", "^CD4_TCM > KI67_", "^CD4_TEM > KI67_"#, "^CD4_TSCM > KI67_"
+                      )
+major_cell_names_display <- c("KI67+ Monocytes", "KI67+ CD8T cell", "KI67+ CD8Tcm cell", "KI67+ CD4T cell (non-FH)", "KI67+ Treg cell", "KI67+ NKT cell",
+                              "KI67+ B cell", "KI67+ NK cell", "KI67+ CD4Temra cell", "KI67+ DPT cell", "KI67+ DC", "KI67+ GDT cell", "KI67+ DNT cell",
+                      "KI67+ CD4T cell (FH)",  # "KI67+ CD4T cell (non-Treg)",
+                      "KI67+ CD8Tnaive cell", "KI67+ CD8Tem cell", "KI67+ CD8Temra cell",
+                      "KI67+ CD4Tnaive cell", "KI67+ CD4Tcm cell", "KI67+ CD4Tem cell"#, "KI67+ CD4Tscm cell"
+                      )
+
+
+colnames(HCI002_all_info)[grepl("^BASOPHIL > KI67_", colnames(HCI002_all_info))]
+colnames(HCI002_all_info)[grepl("^CD8_TCM > KI67_", colnames(HCI002_all_info))]
+#colnames(HCI002_all_info)[grepl("^CD4_TSCM > PD1_", colnames(HCI002_all_info))]
+#colnames(HCI002_all_info)[grepl("^CD4_TSCM > PDL1_", colnames(HCI002_all_info))]
+
+colnames(HCI002_all_info)[grepl("non.*KI67_", colnames(HCI002_all_info))]
+
+joined_string <- paste(major_cell_names, collapse = "|")
+HCI002_major_cells_info <- HCI002_all_info[grepl(joined_string, colnames(HCI002_all_info))]
+HCI002_major_cells_info <- cbind(HCI002_major_cells_info, HCI002_all_info[c(phenotype_grouping)])
+HCI002_major_cells_info <- HCI002_major_cells_info[!grepl("diff|_ABS$", colnames(HCI002_major_cells_info))]
+colnames(HCI002_major_cells_info) <- gsub("_FC_", "_", colnames(HCI002_major_cells_info))
+colnames(HCI002_major_cells_info) <- gsub("L3$|L2$", "", colnames(HCI002_major_cells_info))
+
+
+
+# Generate plots for each cell type
+plots_list <- list()
+for(i in seq_along(major_cell_names)){
+  cell_pattern <- sub("\\^", "", major_cell_names[i])  # removing regex special char
+  plots_list[[i]] <- plot_cell_boxplots(HCI002_major_cells_info, cell_pattern, major_cell_names_display[i], ymax = 5, ylabel_height = 4.2, ytickstep = 1, labeltextadd = 0.25*2.5, phenotype = "Response") 
+}
+
+# Combine all plots into a grid
+combined_plot <- ggarrange(plotlist = plots_list, ncol=6, nrow=ceiling(length(plots_list)/6), common.legend = TRUE, legend="bottom",
+                           heights = rep(1, ceiling(length(plots_list)/6))
+                           )
+
+# Save to PDF
+ggsave(paste0(result_figure_dir, "major_celltype_boxplots_vs_",phenotype_grouping,"_HCI002.pdf"), combined_plot, # major_celltype_boxplots_HCI002.pdf PD1_PDL1 CTLA4 KI67
+       width = 20*0.65, height = ceiling(length(plots_list) / 6) * 3*0.65,
+       units = "in", device = "pdf")
+
+```
+
+# Supplementary Table 6. Calculate AUCs, odds ratios, fold changes, and their pvalues, respectively
+```{r} 
+
+phenotype_name = "IRAEactionable01"
+phenotype_df = HCI002_all_info[,phenotype_name, drop = F]
+HCI002_filtered_info = HCI002_all_info[60:25931]
+feature_names <- colnames(HCI002_filtered_info)
+HCI002_filtered_info = cbind(HCI002_filtered_info, phenotype_df)
+
+# Create an empty result data frame with appropriate column names
+result_columns <- c()
+result_columns <- c(paste0(phenotype_name, "_AUC"), paste0(phenotype_name, "_pval1"), paste0(phenotype_name, "_OddsRatio"), paste0(phenotype_name, "_pval2"), paste0(phenotype_name, "_FoldChange"), paste0(phenotype_name, "_pval3"))
+HCI002_result_df <- data.frame(matrix(ncol = length(result_columns), nrow = length(feature_names)), row.names = feature_names)
+colnames(HCI002_result_df) <- result_columns
+
+# Loop through each feature to calculate statistics
+phenotype <- HCI002_filtered_info[[phenotype_name]]
+for (feature_i in seq_along(feature_names)) {
+  if (feature_i %% 500 == 0) {
+    cat(feature_i, "features processed...\n")
+  }
+  feature <- feature_names[feature_i]
+  feature_values <- HCI002_filtered_info[[feature]]
+  valid_idx <- !is.na(feature_values) & !is.na(phenotype)
+  
+  if(sum(valid_idx) < 3 || length(unique(phenotype[valid_idx])) < 2) next  # skip if insufficient data
+  
+  values <- feature_values[valid_idx]
+  pheno <- phenotype[valid_idx]
+  
+  # (1) AUC and p-value
+  roc_result=roc(pheno,values, direction="<",levels=c(0, 1)) # direction: control < case group
+  auc_val <- roc_result$auc[1]
+  suppressMessages({
+    roc_test <- roc.test(roc_result, roc(response=pheno, predictor=rep(0.5, length(pheno)), quiet=TRUE), method="delong")
+  })
+  auc_pval <- roc_test$p.value
+  
+  # (2) Odds Ratio and p-value
+  median_val <- median(values, na.rm = TRUE)
+  high_group <- pheno[values > median_val]
+  low_group <- pheno[values <= median_val]
+  
+  high_ratio <- sum(high_group == 1) / length(high_group)
+  low_ratio <- sum(low_group == 1) / length(low_group)
+  odds_ratio <- high_ratio / low_ratio
+  
+  # Contingency table for odds ratio
+  contingency_tbl <- matrix(c(sum(high_group==1), sum(high_group==0),
+                              sum(low_group==1), sum(low_group==0)), 
+                            nrow=2, byrow=TRUE)
+  
+  # Chi-square test on 2x2 contingency table
+  chi_res <- chisq.test(contingency_tbl, correct = FALSE)  # Set correct=TRUE to apply Yates' correction
+  odds_pval <- chi_res$p.value
+  
+  # (3) Fold change and Wilcoxon p-value
+  mean_1 <- median(values[pheno == 1], na.rm = TRUE)
+  mean_0 <- median(values[pheno == 0], na.rm = TRUE)
+  
+  fold_change <- mean_1 / mean_0
+  
+  wilcox_res <- wilcox.test(values[pheno == 1], values[pheno == 0])
+  wilcox_pval <- wilcox_res$p.value
+  
+  # Store results
+  HCI002_result_df[feature,] <- c(auc_val, auc_pval, odds_ratio, odds_pval, fold_change, wilcox_pval)
+}
+
+# View the result dataframe
+head(HCI002_result_df)
+
+```
+
+# Figure 2E,G,I/Figure 4A/SFigure 5A,C,E. Volcano plots (AUCs vs pvalues, odds ratios vs pvalues, Fold change vs pvalues)
+```{r}
+
+phenotype_names_vec <- c("IRAEactionable01") 
+metric_test_suffix_vec <- c("AUC", "OddsRatio", "FoldChange")  
+data_modality <- "flow" # flow olink
+timePt_vec <- c("baseline", "ontreat", "FC_on_pre") 
+
+random_seed = 1 
+ymax = 10 
+for(phenotype_name in phenotype_names_vec){
+  for(metric_test_suffix in metric_test_suffix_vec){
+    for(timePt in timePt_vec){
+      ## remove IGG4+; remove non-single CyTOF markers
+      rn <- rownames(HCI002_result_df)
+      has_igg4 <- grepl("IGG4", rn)
+      has_gt_fc_with_multiple_underscores <- grepl(">([^F]*_){2,}[^F]*FC", rn)
+      rows_to_remove <- has_igg4 | has_gt_fc_with_multiple_underscores
+      HCI002_result_df <- HCI002_result_df[!rows_to_remove, ]
+      
+      metric_test <- paste0(phenotype_name, "_", metric_test_suffix) 
+      
+      HCI002_result_df_1modality <- HCI002_result_df[grepl(timePt, rownames(HCI002_result_df)), ]
+      HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] <- log2(HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]])
+      HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] <- log2(HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]])
+      if (data_modality == "flow"){
+        HCI002_result_df_1modality <- HCI002_result_df_1modality[!grepl("_OLINK_|ABS", rownames(HCI002_result_df_1modality)), ]
+        HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+        HCI002_result_df_1modality$Feature <- sub("_FC.*", "", HCI002_result_df_1modality$Feature)
+      }else if (data_modality == "olink"){
+        HCI002_result_df_1modality <- HCI002_result_df_1modality[grepl("_OLINK_", rownames(HCI002_result_df_1modality)), ]
+        HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+        HCI002_result_df_1modality$Feature <- sub("_OLINK.*", "", HCI002_result_df_1modality$Feature)
+        # convert OID to gene symbols
+        map_df <- read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+        # Ensure both columns are character type
+        map_df$OlinkID <- as.character(map_df$OlinkID)
+        colnames(map_df) <- c("Feature", "GeneSymbol")
+        HCI002_result_df_1modality$Feature <- as.character(HCI002_result_df_1modality$Feature)
+        # Merge to map OlinkID to Assay (gene symbol)
+        HCI002_result_df_1modality <- merge(
+          HCI002_result_df_1modality,
+          map_df,
+          by = "Feature",
+          all.x = TRUE,
+          sort = FALSE
+        )
+        # remove duplicated gene symbols
+        HCI002_result_df_1modality$OlinkID <- HCI002_result_df_1modality$Feature
+        HCI002_result_df_1modality$Feature <- HCI002_result_df_1modality$GeneSymbol
+        HCI002_result_df_1modality$GeneSymbol <- NULL
+        HCI002_result_df_1modality <- HCI002_result_df_1modality[!duplicated(HCI002_result_df_1modality$Feature), ]
+      }
+      
+      if (metric_test_suffix == "AUC"){
+        HCI002_result_df_1modality$FDR <- HCI002_result_df_1modality[[paste0(phenotype_name,"_pval1")]]
+        x_label <- "AUC"
+        fc_cutoff = 0.5
+        fc_lower = 0.4
+        fc_upper = 0.6
+        ylim <- c(0.1, ymax) # -log10(FDR)
+        if ((phenotype_name == "Response01") | (timePt == "baseline")){
+          ylim <- c(0.1, 5)
+        }
+        if (data_modality == "olink"){
+          ylim <- c(0.1, ymax)
+        }
+        xlim <- c(0, 1) # AUC
+      }else if (metric_test_suffix == "OddsRatio"){
+        HCI002_result_df_1modality$FDR <- HCI002_result_df_1modality[[paste0(phenotype_name,"_pval2")]]
+        x_label <- "Log2 (Odds ratio)"
+        fc_cutoff = 0
+        fc_lower = -0.25
+        fc_upper = 0.25
+        ylim <- c(0.1, ymax) # -log10(FDR)
+        xlim <- c(-2, 2) # Log2 (Odds ratio)
+        if ((phenotype_name == "Response01") | (timePt == "baseline")){
+          ylim <- c(0.1, 5)
+          xlim <- c(-2, 2)
+        }
+        if (timePt == "FC_on_pre"){
+          xlim <- c(-3, 3)
+          if (data_modality == "olink"){
+            xlim <- c(-2, 2)
+          }
+        }
+        if (data_modality == "olink"){
+          ylim <- c(0.1, ymax)
+        }
+        
+      }else if (metric_test_suffix == "FoldChange"){
+        HCI002_result_df_1modality$FDR <- HCI002_result_df_1modality[[paste0(phenotype_name,"_pval3")]]
+        x_label <- "Log2 (Fold change)"
+        fc_cutoff = 0
+        fc_lower = -0.25
+        fc_upper = 0.25
+        ylim <- c(0.1, ymax) # -log10(FDR)
+        xlim <- c(-2, 2) # Log2 (Fold change)
+        if ((phenotype_name == "Response01") | (timePt == "baseline")){
+          ylim <- c(0.1, 5)
+          xlim <- c(-2, 2)
+        }
+        if (timePt == "FC_on_pre"){
+          xlim <- c(-3, 3)
+          if (data_modality == "olink"){
+            xlim <- c(-2, 2)
+          }
+        }
+        if (data_modality == "olink"){
+          ylim <- c(0.1, ymax)
+          if (phenotype_name == "Response01"){
+            xlim <- c(-3, 3) # Log2 (Fold change)
+          }
+        }
+      }
+      
+      HCI002_result_df_1modality <- HCI002_result_df_1modality[order(-HCI002_result_df_1modality[[metric_test]]), ]
+      
+      de_df <- HCI002_result_df_1modality[c("Feature", metric_test, "FDR")] # 
+      colnames(de_df) <- c("Feature_name", "EffectorSize", "FDR")
+      
+      de_df <- de_df[order(-de_df$EffectorSize), ]
+      
+      ####### Create the volcano plot
+      FDR_cutoff = 0.05
+      # Transform the results into a dataframe for plotting
+      de_df$diffexpressed = "ns"
+      de_df$diffexpressed[(de_df$EffectorSize < fc_lower) & (de_df$FDR < FDR_cutoff)] = "down"
+      de_df$diffexpressed[(de_df$EffectorSize > fc_upper) & (de_df$FDR < FDR_cutoff)] = "up"
+      de_df_sig = de_df[de_df$diffexpressed != "ns",]
+      
+      de_df_up = de_df_sig[de_df_sig$EffectorSize > fc_upper,]
+      de_df_down = de_df_sig[de_df_sig$EffectorSize < fc_lower,]
+
+      top_up_genes = head(de_df_up[order(de_df_up$FDR), "Feature_name"], 5)
+      top_down_genes = head(de_df_down[order(de_df_down$FDR), "Feature_name"], 5)
+      
+      label_genes = union(top_up_genes,top_down_genes)
+      
+      # Transform gene labels
+      label_genes_show <- convert_label_genes(label_genes)
+      
+      # Create a named vector to map original labels to transformed labels
+      label_map <- setNames(label_genes_show, label_genes)
+      # Assign transformed labels to de_df$delabel where Feature_name matches label_genes
+      de_df$delabel <- ifelse(de_df$Feature_name %in% label_genes, 
+                              label_map[de_df$Feature_name], 
+                              NA)
+      
+      # Define the original FDR values and their transformed positions
+      fdr_values <- c(0.01, 0.05, 0.1, 1)  # Original FDR values
+      log_fdr_values <- -log10(fdr_values)  # Corresponding -log10(FDR)
+      font_size <- 14  # Change this to your preferred size
+      
+      myvolcanoplot <- ggplot(de_df, 
+                              aes(x = EffectorSize, 
+                                  y = -log10(FDR))) +
+        # dashed thresholds
+        geom_vline(xintercept = c(fc_lower, fc_upper),
+                   colour = "gray", linetype = "dashed") +
+        geom_hline(yintercept = -log10(FDR_cutoff),
+                   colour = "gray", linetype = "dashed") +
+        
+        # points coloured by diffexpressed
+        geom_point(aes(colour = diffexpressed),
+                   size = 2, alpha = 1, stroke = 0) +
+        scale_y_continuous(breaks = function(x) pretty(x, n = 5)) +
+        
+        geom_label_repel(
+          aes(label = delabel, colour = diffexpressed),
+          size = 3,
+          max.overlaps = Inf,
+          force = 1,
+          force_pull = 1,
+          point.padding = 0.25,
+          label.padding = 0.25,
+          box.padding = 0.25, # 0.5 1
+          fill = alpha("white", 0.5),   # Semi-transparent white background
+          label.size = NA,              # Remove label border line
+          nudge_y = runif(n = nrow(de_df), min = -1, max = 1),
+          seed = random_seed,
+          show.legend = FALSE
+        )+
+        
+        # define three colours
+        scale_colour_manual(values = c(
+          down = "#00AFBB",
+          ns   = "grey",
+          up   = "#bb0c00"
+        )) +
+        
+        coord_cartesian(xlim = xlim, ylim = ylim) +
+        labs(x = x_label, y = "-Log10 (p)") +
+        ggtitle("") +
+        theme_minimal() +
+        guides(colour = "none")+
+        theme(
+          panel.grid = element_blank(), 
+          panel.background = element_rect(fill = "white"),
+          axis.line.y = element_line(color="black"),
+          axis.line.x = element_line(color="black"),
+          axis.ticks.y = element_line(color="black"),
+          axis.ticks.x = element_line(color="black"),
+          panel.border = element_blank(), # remove top and right border lines
+          axis.title.y = element_text(margin = margin(0,5,0,0), size = rel(1.1), color = 'black'),
+          axis.title.x = element_text(hjust = 0.5, margin = margin(5,0,0,0), size = rel(1.1), color = 'black'),
+          plot.title = element_text(hjust = 0.5, size = font_size),
+          axis.text.x = element_text(color = "black", margin = margin(t = 5)),
+          axis.text.y = element_text(color = "black", margin = margin(r = 5)),
+          legend.position = "none",
+          text = element_text(size = font_size),  # Apply to all text
+          axis.title = element_text(size = font_size),  # Axis titles
+          axis.text = element_text(size = font_size),  # Axis labels
+          legend.text = element_text(size = font_size),  # Legend labels
+          legend.title = element_text(size = font_size),  # Legend title
+        )
+      
+      # save
+      pdf(file = paste0(result_figure_dir, "Volcano_plot_HCI002_",metric_test,"_",timePt,"_",data_modality,".pdf"), width = 3.5, height = 3.5*1.1)
+      print(myvolcanoplot)
+      dev.off()
+    }
+  }
+}
+
+
+```
+
+# Figure 2F,H,J/SFigure 5B,D,F. Venn plots
+```{r}
+
+fc_lower_AUC = 0.4
+fc_upper_AUC = 0.6
+fc_lower_OR = -0.25
+fc_upper_OR = 0.25
+fc_lower_FC = -0.25
+fc_upper_FC = 0.25
+
+# load results
+phenotype_name = "IRAEactionable01" 
+### load results
+HCI002_result_df <- read.csv(file = paste0(result_dir, "HCI002_all_info_20241008_",phenotype_name,"_AUC_OddsRatio_FoldChange.csv"), row.names = 1)
+## remove IGG4+; remove non-single CyTOF markers
+rn <- rownames(HCI002_result_df)
+has_igg4 <- grepl("IGG4", rn)
+has_gt_fc_with_multiple_underscores <- grepl(">([^F]*_){2,}[^F]*FC", rn)
+rows_to_remove <- has_igg4 | has_gt_fc_with_multiple_underscores
+HCI002_result_df <- HCI002_result_df[!rows_to_remove, ]
+
+data_modality <- "olink" # flow olink
+timePt = "baseline" # baseline ontreat FC_on_pre
+
+################ baseline ################
+HCI002_result_df_1modality <- HCI002_result_df[grepl("baseline", rownames(HCI002_result_df)), ]
+if (data_modality == "flow"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!grepl("_OLINK_|ABS", rownames(HCI002_result_df_1modality)), ]
+}else if (data_modality == "olink"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[grepl("_OLINK_", rownames(HCI002_result_df_1modality)), ]
+}
+
+if (data_modality == "flow"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!grepl("_OLINK_|ABS", rownames(HCI002_result_df_1modality)), ]
+  HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+  HCI002_result_df_1modality$Feature <- sub("_FC.*", "", HCI002_result_df_1modality$Feature)
+}else if (data_modality == "olink"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[grepl("_OLINK_", rownames(HCI002_result_df_1modality)), ]
+  HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+  HCI002_result_df_1modality$Feature <- sub("_OLINK.*", "", HCI002_result_df_1modality$Feature)
+  # convert OID to gene symbols
+  map_df <- read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+  # Ensure both columns are character type
+  map_df$OlinkID <- as.character(map_df$OlinkID)
+  colnames(map_df) <- c("Feature", "GeneSymbol")
+  HCI002_result_df_1modality$Feature <- as.character(HCI002_result_df_1modality$Feature)
+  # Merge to map OlinkID to Assay (gene symbol)
+  HCI002_result_df_1modality <- merge(
+    HCI002_result_df_1modality,
+    map_df,
+    by = "Feature",
+    all.x = TRUE,
+    sort = FALSE
+  )
+  # remove duplicated gene symbols
+  HCI002_result_df_1modality$OlinkID <- HCI002_result_df_1modality$Feature
+  HCI002_result_df_1modality$Feature <- HCI002_result_df_1modality$GeneSymbol
+  HCI002_result_df_1modality$GeneSymbol <- NULL
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!duplicated(HCI002_result_df_1modality$Feature), ]
+}
+
+
+HCI002_result_df_1modality$FDR <- HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]]
+Feature_pos_baseline_AUC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_AUC")]] > fc_upper_AUC)]
+Feature_neg_baseline_AUC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_AUC")]] < fc_lower_AUC)]
+Feature_pos_baseline_OR <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval2")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] > 2^fc_upper_OR)]
+Feature_neg_baseline_OR <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval2")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] < 2^fc_lower_OR)]
+Feature_pos_baseline_FC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval3")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] > 2^fc_upper_FC)]
+Feature_neg_baseline_FC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval3")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] < 2^fc_lower_FC)]
+
+Feature_pos_pre_common <- Reduce(intersect, list(Feature_pos_baseline_AUC, Feature_pos_baseline_OR, Feature_pos_baseline_FC))
+Feature_neg_pre_common <- Reduce(intersect, list(Feature_neg_baseline_AUC, Feature_neg_baseline_OR, Feature_neg_baseline_FC))
+Feature_pos_pre_common_show <- as.character(convert_label_genes(Feature_pos_pre_common))
+Feature_neg_pre_common_show <- as.character(convert_label_genes(Feature_neg_pre_common))
+cat(Feature_pos_pre_common_show, sep = "\n")
+cat(Feature_neg_pre_common_show, sep = "\n")
+cat(Feature_pos_pre_common_show, sep = "', '")
+cat(Feature_neg_pre_common_show, sep = "', '")
+
+Feature_pos_baseline_AUC <- Feature_pos_baseline_AUC[!is.na(Feature_pos_baseline_AUC)]
+Feature_pos_baseline_OR <- Feature_pos_baseline_OR[!is.na(Feature_pos_baseline_OR)]
+Feature_pos_baseline_FC <- Feature_pos_baseline_FC[!is.na(Feature_pos_baseline_FC)]
+plot_venn_three_sets(
+  Feature_pos_baseline_AUC,
+  Feature_pos_baseline_OR,
+  Feature_pos_baseline_FC,
+  fig_name = paste0(result_figure_dir, "Venn_Features_HCI002_",phenotype_name,"_Positive_Baseline.pdf")
+)
+
+Feature_neg_baseline_AUC <- Feature_neg_baseline_AUC[!is.na(Feature_neg_baseline_AUC)]
+Feature_neg_baseline_OR <- Feature_neg_baseline_OR[!is.na(Feature_neg_baseline_OR)]
+Feature_neg_baseline_FC <- Feature_neg_baseline_FC[!is.na(Feature_neg_baseline_FC)]
+plot_venn_three_sets(
+  Feature_neg_baseline_AUC,
+  Feature_neg_baseline_OR,
+  Feature_neg_baseline_FC,
+  fig_name = paste0(result_figure_dir, "Venn_Features_HCI002_",phenotype_name,"_Negative_Baseline.pdf")
+)
+
+
+
+
+################ ontreat ################
+HCI002_result_df_1modality <- HCI002_result_df[grepl("ontreat", rownames(HCI002_result_df)), ]
+if (data_modality == "flow"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!grepl("_OLINK_|ABS", rownames(HCI002_result_df_1modality)), ]
+  HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+  HCI002_result_df_1modality$Feature <- sub("_FC.*", "", HCI002_result_df_1modality$Feature)
+}else if (data_modality == "olink"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[grepl("_OLINK_", rownames(HCI002_result_df_1modality)), ]
+  HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+  HCI002_result_df_1modality$Feature <- sub("_OLINK.*", "", HCI002_result_df_1modality$Feature)
+  # convert OID to gene symbols
+  map_df <- read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+  # Ensure both columns are character type
+  map_df$OlinkID <- as.character(map_df$OlinkID)
+  colnames(map_df) <- c("Feature", "GeneSymbol")
+  HCI002_result_df_1modality$Feature <- as.character(HCI002_result_df_1modality$Feature)
+  # Merge to map OlinkID to Assay (gene symbol)
+  HCI002_result_df_1modality <- merge(
+    HCI002_result_df_1modality,
+    map_df,
+    by = "Feature",
+    all.x = TRUE,
+    sort = FALSE
+  )
+  # remove duplicated gene symbols
+  HCI002_result_df_1modality$OlinkID <- HCI002_result_df_1modality$Feature
+  HCI002_result_df_1modality$Feature <- HCI002_result_df_1modality$GeneSymbol
+  HCI002_result_df_1modality$GeneSymbol <- NULL
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!duplicated(HCI002_result_df_1modality$Feature), ]
+}
+
+HCI002_result_df_1modality$FDR <- HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]]
+
+Feature_pos_ontreat_AUC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_AUC")]] > fc_upper_AUC)]
+Feature_neg_ontreat_AUC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_AUC")]] < fc_lower_AUC)]
+Feature_pos_ontreat_OR <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval2")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] > 2^fc_upper_OR)]
+Feature_neg_ontreat_OR <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval2")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] < 2^fc_lower_OR)]
+Feature_pos_ontreat_FC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval3")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] > 2^fc_upper_FC)]
+Feature_neg_ontreat_FC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval3")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] < 2^fc_lower_FC)]
+
+Feature_pos_ontreat_common <- Reduce(intersect, list(Feature_pos_ontreat_AUC, Feature_pos_ontreat_OR, Feature_pos_ontreat_FC))
+Feature_neg_ontreat_common <- Reduce(intersect, list(Feature_neg_ontreat_AUC, Feature_neg_ontreat_OR, Feature_neg_ontreat_FC))
+Feature_pos_ontreat_common_show <- as.character(convert_label_genes(Feature_pos_ontreat_common))
+Feature_neg_ontreat_common_show <- as.character(convert_label_genes(Feature_neg_ontreat_common))
+cat(Feature_pos_ontreat_common_show, sep = "\n")
+cat(Feature_neg_ontreat_common_show, sep = "\n")
+
+a <- Feature_pos_ontreat_common_show[Feature_pos_ontreat_common_show %in% Feature_pos_pre_common_show]
+cat(a, sep = "\n")
+a <- Feature_neg_ontreat_common_show[Feature_neg_ontreat_common_show %in% Feature_neg_pre_common_show]
+cat(a, sep = "\n")
+
+Feature_pos_ontreat_AUC <- Feature_pos_ontreat_AUC[!is.na(Feature_pos_ontreat_AUC)]
+Feature_pos_ontreat_OR <- Feature_pos_ontreat_OR[!is.na(Feature_pos_ontreat_OR)]
+Feature_pos_ontreat_FC <- Feature_pos_ontreat_FC[!is.na(Feature_pos_ontreat_FC)]
+plot_venn_three_sets(
+  Feature_pos_ontreat_AUC,
+  Feature_pos_ontreat_OR,
+  Feature_pos_ontreat_FC,
+  fig_name = paste0(result_figure_dir, "Venn_Features_HCI002_",phenotype_name,"_Positive_ontreat.pdf")
+)
+
+Feature_neg_ontreat_AUC <- Feature_neg_ontreat_AUC[!is.na(Feature_neg_ontreat_AUC)]
+Feature_neg_ontreat_OR <- Feature_neg_ontreat_OR[!is.na(Feature_neg_ontreat_OR)]
+Feature_neg_ontreat_FC <- Feature_neg_ontreat_FC[!is.na(Feature_neg_ontreat_FC)]
+plot_venn_three_sets(
+  Feature_neg_ontreat_AUC,
+  Feature_neg_ontreat_OR,
+  Feature_neg_ontreat_FC,
+  fig_name = paste0(result_figure_dir, "Venn_Features_HCI002_",phenotype_name,"_Negative_ontreat.pdf")
+)
+
+
+
+
+################ FC_on_pre ################
+HCI002_result_df_1modality <- HCI002_result_df[grepl("FC_on_pre", rownames(HCI002_result_df)), ]
+if (data_modality == "flow"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!grepl("_OLINK_|ABS", rownames(HCI002_result_df_1modality)), ]
+  HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+  HCI002_result_df_1modality$Feature <- sub("_FC.*", "", HCI002_result_df_1modality$Feature)
+}else if (data_modality == "olink"){
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[grepl("_OLINK_", rownames(HCI002_result_df_1modality)), ]
+  HCI002_result_df_1modality$Feature <- rownames(HCI002_result_df_1modality)
+  HCI002_result_df_1modality$Feature <- sub("_OLINK.*", "", HCI002_result_df_1modality$Feature)
+  # convert OID to gene symbols
+  map_df <- read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+  # Ensure both columns are character type
+  map_df$OlinkID <- as.character(map_df$OlinkID)
+  colnames(map_df) <- c("Feature", "GeneSymbol")
+  HCI002_result_df_1modality$Feature <- as.character(HCI002_result_df_1modality$Feature)
+  # Merge to map OlinkID to Assay (gene symbol)
+  HCI002_result_df_1modality <- merge(
+    HCI002_result_df_1modality,
+    map_df,
+    by = "Feature",
+    all.x = TRUE,
+    sort = FALSE
+  )
+  # remove duplicated gene symbols
+  HCI002_result_df_1modality$OlinkID <- HCI002_result_df_1modality$Feature
+  HCI002_result_df_1modality$Feature <- HCI002_result_df_1modality$GeneSymbol
+  HCI002_result_df_1modality$GeneSymbol <- NULL
+  HCI002_result_df_1modality <- HCI002_result_df_1modality[!duplicated(HCI002_result_df_1modality$Feature), ]
+}
+
+HCI002_result_df_1modality$FDR <- HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]]
+Feature_pos_FC_on_pre_AUC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_AUC")]] > fc_upper_AUC)]
+Feature_neg_FC_on_pre_AUC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval1")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_AUC")]] < fc_lower_AUC)]
+Feature_pos_FC_on_pre_OR <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval2")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] > 2^fc_upper_OR)]
+Feature_neg_FC_on_pre_OR <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval2")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_OddsRatio")]] < 2^fc_lower_OR)]
+Feature_pos_FC_on_pre_FC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval3")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] > 2^fc_upper_FC)]
+Feature_neg_FC_on_pre_FC <- HCI002_result_df_1modality$Feature[(HCI002_result_df_1modality[[paste0(phenotype_name, "_pval3")]] < 0.05) & (HCI002_result_df_1modality[[paste0(phenotype_name, "_FoldChange")]] < 2^fc_lower_FC)]
+
+Feature_pos_FC_on_pre_common <- Reduce(intersect, list(Feature_pos_FC_on_pre_AUC, Feature_pos_FC_on_pre_OR, Feature_pos_FC_on_pre_FC))
+Feature_neg_FC_on_pre_common <- Reduce(intersect, list(Feature_neg_FC_on_pre_AUC, Feature_neg_FC_on_pre_OR, Feature_neg_FC_on_pre_FC))
+Feature_pos_FC_on_pre_common_show <- as.character(convert_label_genes(Feature_pos_FC_on_pre_common))
+Feature_neg_FC_on_pre_common_show <- as.character(convert_label_genes(Feature_neg_FC_on_pre_common))
+cat(Feature_pos_FC_on_pre_common_show, sep = "\n")
+cat(Feature_neg_FC_on_pre_common_show, sep = "\n")
+
+a <- Feature_pos_FC_on_pre_common_show[Feature_pos_FC_on_pre_common_show %in% Feature_pos_pre_common_show]
+a <- Feature_pos_FC_on_pre_common_show[Feature_pos_FC_on_pre_common_show %in% unique(c(Feature_pos_pre_common_show, Feature_pos_ontreat_common_show))]
+a <- Feature_pos_FC_on_pre_common_show[Feature_pos_FC_on_pre_common_show %in% setdiff(Feature_pos_ontreat_common_show, Feature_pos_pre_common_show)]
+a <- Feature_neg_ontreat_common_show[!(Feature_neg_ontreat_common_show %in% unique(c(Feature_neg_pre_common_show, Feature_neg_FC_on_pre_common_show)))]
+cat(a, sep = "\n")
+b <- a[a %in% Feature_pos_ontreat_common_show]
+cat(b, sep = "\n")
+a <- Feature_neg_FC_on_pre_common_show[Feature_neg_FC_on_pre_common_show %in% Feature_neg_pre_common_show]
+a <- Feature_neg_FC_on_pre_common_show[Feature_neg_FC_on_pre_common_show %in% Feature_neg_ontreat_common_show]
+a <- Feature_neg_FC_on_pre_common_show[Feature_neg_FC_on_pre_common_show %in% setdiff(Feature_neg_ontreat_common_show, Feature_neg_pre_common_show)]
+cat(a, sep = "\n")
+
+Feature_pos_FC_on_pre_AUC <- Feature_pos_FC_on_pre_AUC[!is.na(Feature_pos_FC_on_pre_AUC)]
+Feature_pos_FC_on_pre_OR <- Feature_pos_FC_on_pre_OR[!is.na(Feature_pos_FC_on_pre_OR)]
+Feature_pos_FC_on_pre_FC <- Feature_pos_FC_on_pre_FC[!is.na(Feature_pos_FC_on_pre_FC)]
+plot_venn_three_sets(
+  Feature_pos_FC_on_pre_AUC,
+  Feature_pos_FC_on_pre_OR,
+  Feature_pos_FC_on_pre_FC,
+  fig_name = paste0(result_figure_dir, "Venn_Features_HCI002_",phenotype_name,"_Positive_FC_on_pre.pdf")
+)
+
+Feature_neg_FC_on_pre_AUC <- Feature_neg_FC_on_pre_AUC[!is.na(Feature_neg_FC_on_pre_AUC)]
+Feature_neg_FC_on_pre_OR <- Feature_neg_FC_on_pre_OR[!is.na(Feature_neg_FC_on_pre_OR)]
+Feature_neg_FC_on_pre_FC <- Feature_neg_FC_on_pre_FC[!is.na(Feature_neg_FC_on_pre_FC)]
+plot_venn_three_sets(
+  Feature_neg_FC_on_pre_AUC,
+  Feature_neg_FC_on_pre_OR,
+  Feature_neg_FC_on_pre_FC,
+  fig_name = paste0(result_figure_dir, "Venn_Features_HCI002_",phenotype_name,"_Negative_FC_on_pre.pdf")
+)
+
+
+```
+
+# Pathway enrichment of irAE-correlated olink proteins (HCI002)
+```{r}
+
+proteins_pos_common <- Reduce(union, list(Feature_pos_FC_on_pre_common, Feature_pos_ontreat_common, Feature_pos_pre_common))
+olink_proteins_pos <- na.omit(proteins_pos_common)
+
+proteins_neg_common <- Reduce(union, list(Feature_neg_FC_on_pre_common, Feature_neg_ontreat_common, Feature_neg_pre_common))
+olink_proteins_neg <- na.omit(proteins_neg_common)
+
+olink_proteins_pos_ids <- mapIds(org.Hs.eg.db, keys = olink_proteins_pos, column = "ENTREZID", keytype = "SYMBOL")
+olink_proteins_neg_ids <- mapIds(org.Hs.eg.db, keys = olink_proteins_neg, column = "ENTREZID", keytype = "SYMBOL")
+
+
+#### MSigDB pathways
+msigdb <- msigdbr(species = "Homo sapiens", category = "H")
+msigdbr_t2g = msigdb %>% dplyr::distinct(gs_name, entrez_gene) %>% as.data.frame()
+
+all_pathways = unique(msigdbr_t2g$gs_name)
+all_pathways_short = c("Adipogenesis", "Allograft rejection", "Androgen response", "Angiogenesis", "Apical junction", "Apical surface", "Apoptosis", "Bile acid metabolism", "Cholesterol homeostasis", "Coagulation", "Complement", "DNA repair", "E2F targets", "Epithelial mesenchymal transition", "Estrogen response (early)", "Estrogen response (late)", "Fatty acid metabolism", "G2M checkpoint", "Glycolysis", "Hedgehog signaling", "Heme metabolism", "Hypoxia", "IL2/STAT5 signaling", "IL6/JAK/STAT3 signaling", "Inflammatory response", "IFN-alpha response", "IFN-gamma response", "KRAS signaling (down)", "KRAS signaling (up)", "Mitotic spindle", "MTORC1 signaling", "MYC targets (v1)", "myc targets v2", "Myogenesis", "NOTCH signaling", "Oxidative phosphorylation", "P53 pathway", "Pancreas beta cells", "Peroxisome", "PI3K/AKT/MTOR signaling", "Protein secretion", "Reactive oxygen species pathway", "Spermatogenesis", "TGF-beta signaling", "TNFA signaling via NFKB", "Unfolded protein response", "UV response (down)", "UV response (up)", "WNT-beta/Catenin signaling", "Xenobiotic metabolism")
+MSigDB_mapping <- setNames(all_pathways_short, all_pathways)
+
+olink_proteins_pos_MSigDB <- enricher(gene = olink_proteins_pos_ids,
+                                      pvalueCutoff = 0.05,
+                                      pAdjustMethod = "BH",
+                                      universe = keys(org.Hs.eg.db),
+                                      minGSSize = 15,
+                                      maxGSSize = 500,
+                                      TERM2GENE = msigdbr_t2g)
+olink_proteins_neg_MSigDB <- enricher(gene = olink_proteins_neg_ids,
+                                      pvalueCutoff = 0.05,
+                                      pAdjustMethod = "BH",
+                                      universe = keys(org.Hs.eg.db),
+                                      minGSSize = 15,
+                                      maxGSSize = 500,
+                                      TERM2GENE = msigdbr_t2g)
+
+olink_proteins_pos_MSigDB$Description
+olink_proteins_neg_MSigDB$Description
+olink_proteins_pos_MSigDB$p.adjust
+olink_proteins_neg_MSigDB$p.adjust
+
+olink_proteins_pos_gene_symbols <- convert_gene_ids_to_symbols(olink_proteins_pos_MSigDB@result$geneID, olink_proteins_pos_ids)
+olink_proteins_pos_MSigDB_df = data.frame(
+    Pathway = olink_proteins_pos_MSigDB@result$Description,
+    AdjPval = olink_proteins_pos_MSigDB@result$p.adjust,  
+    GeneCount = olink_proteins_pos_MSigDB@result$Count,
+    GeneSymbols = unlist(olink_proteins_pos_gene_symbols)
+  )
+olink_proteins_pos_MSigDB_df$Pathway = MSigDB_mapping[olink_proteins_pos_MSigDB_df$Pathway]
+olink_proteins_pos_MSigDB_df = olink_proteins_pos_MSigDB_df[olink_proteins_pos_MSigDB_df$AdjPval < 0.05, ] 
+olink_proteins_pos_MSigDB_df$Direction = "Positive"
+
+olink_proteins_neg_gene_symbols <- convert_gene_ids_to_symbols(olink_proteins_neg_MSigDB@result$geneID, olink_proteins_neg_ids)
+olink_proteins_neg_MSigDB_df = data.frame(
+    Pathway = olink_proteins_neg_MSigDB@result$Description,
+    AdjPval = olink_proteins_neg_MSigDB@result$p.adjust,  
+    GeneCount = olink_proteins_neg_MSigDB@result$Count,
+    GeneSymbols = unlist(olink_proteins_neg_gene_symbols)
+  )
+olink_proteins_neg_MSigDB_df$Pathway = MSigDB_mapping[olink_proteins_neg_MSigDB_df$Pathway]
+olink_proteins_neg_MSigDB_df = olink_proteins_neg_MSigDB_df[olink_proteins_neg_MSigDB_df$AdjPval < 0.05, ] # None
+olink_proteins_neg_MSigDB_df$Direction = "Negative"
+
+olink_proteins_all_MSigDB_df = rbind(olink_proteins_pos_MSigDB_df, olink_proteins_neg_MSigDB_df)
+
+
+######################### KEGG pathway
+olink_proteins_pos_KEGG <- enrichKEGG(
+                 gene         = olink_proteins_pos_ids,
+                 organism     = 'hsa',
+                 pvalueCutoff = 0.05)
+olink_proteins_neg_KEGG <- enrichKEGG(
+                 gene         = olink_proteins_neg_ids,
+                 organism     = 'hsa',
+                 pvalueCutoff = 0.05)
+olink_proteins_pos_KEGG$Description
+olink_proteins_neg_KEGG$Description
+olink_proteins_pos_KEGG$p.adjust
+olink_proteins_neg_KEGG$p.adjust
+
+olink_proteins_pos_gene_symbols <- convert_gene_ids_to_symbols(olink_proteins_pos_KEGG@result$geneID, olink_proteins_pos_ids)
+olink_proteins_pos_KEGG_df = data.frame(
+    Pathway = olink_proteins_pos_KEGG@result$Description,
+    AdjPval = olink_proteins_pos_KEGG@result$p.adjust,  
+    GeneCount = olink_proteins_pos_KEGG@result$Count,
+    GeneSymbols = unlist(olink_proteins_pos_gene_symbols)
+  )
+olink_proteins_pos_KEGG_df = olink_proteins_pos_KEGG_df[olink_proteins_pos_KEGG_df$AdjPval < 0.05, ] 
+
+olink_proteins_neg_gene_symbols <- convert_gene_ids_to_symbols(olink_proteins_neg_KEGG@result$geneID, olink_proteins_neg_ids)
+olink_proteins_neg_KEGG_df = data.frame(
+    Pathway = olink_proteins_neg_KEGG@result$Description,
+    AdjPval = olink_proteins_neg_KEGG@result$p.adjust,  
+    GeneCount = olink_proteins_neg_KEGG@result$Count,
+    GeneSymbols = unlist(olink_proteins_neg_gene_symbols)
+  )
+olink_proteins_neg_KEGG_df = olink_proteins_neg_KEGG_df[olink_proteins_neg_KEGG_df$AdjPval < 0.05, ] 
+
+```
+
+# Figure 4B/SFigure 5G. Plot pathway enrichment result
+```{r}
+
+up_MSigDB_pathways <- olink_proteins_pos_KEGG # olink_proteins_pos_MSigDB olink_proteins_pos_KEGG
+
+res_df <- as.data.frame(up_MSigDB_pathways)
+res_df$Description <- setNames(MSigDB_mapping, names(MSigDB_mapping))[res_df$ID]
+
+up_MSigDB_pathways@result$Description <- res_df$Description
+sig_pathways_NUM <- sum(up_MSigDB_pathways@result$p.adjust < 0.05)
+
+pdf(paste0(result_figure_dir, "Barplot_pathwayEnrich_HCI002_proteins_irAE.pdf"), width = 3.3*1.2, height = 2*1.2)
+barplot(up_MSigDB_pathways, showCategory = sig_pathways_NUM, p.adjust.digits = 1) + 
+  theme_classic() + 
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"), 
+        axis.line = element_line(color = "black"), 
+        axis.text = element_text(color = "black", size = 8),  # Smaller text
+        axis.text.y = element_text(size = 8, lineheight = 0.8))  # Adjust line height
+dev.off()
+
+```
+
+# Figure 4C. HCI002 Heatmap clustering of samples and Olink proteins FC_on_pre (irAE vs non-irAEs --> DEGs)
+```{r}
+
+irAE_vec <- HCI002_all_info$IRAEactionable01
+irAE_grade_vec <- HCI002_all_info$`irAE Overall Assessment`
+ICBR_vec <- HCI002_all_info$Response01
+sex_vec <- HCI002_all_info$Gender
+IPIdrug_vec <- HCI002_all_info$Drug
+
+genes_show <- c("CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10", "IL12A", "IL21", "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19", "PGF", "CA6")
+
+HCI002_feature_df <- HCI002_all_info[60:25931]
+HCI002_OLINK_baseline_df <- HCI002_feature_df[grepl("OLINK_baseline", colnames(HCI002_feature_df))]
+colnames(HCI002_OLINK_baseline_df) <- gsub("_OLINK_baseline", "", colnames(HCI002_OLINK_baseline_df))
+HCI002_OLINK_ontreat_df <- HCI002_feature_df[grepl("OLINK_ontreat", colnames(HCI002_feature_df))]
+colnames(HCI002_OLINK_ontreat_df) <- gsub("_OLINK_ontreat", "", colnames(HCI002_OLINK_ontreat_df))
+HCI002_OLINK_FC_on_pre_df <- HCI002_feature_df[grepl("OLINK_FC_on_pre", colnames(HCI002_feature_df))]
+colnames(HCI002_OLINK_FC_on_pre_df) <- gsub("_OLINK_FC_on_pre", "", colnames(HCI002_OLINK_FC_on_pre_df))
+
+### map protein names and move duplicated ones
+olink_names <- colnames(HCI002_OLINK_baseline_df)
+protein_names <- HCI002_map_df$Assay[match(olink_names, HCI002_map_df$OlinkID)]
+colnames(HCI002_OLINK_baseline_df) <- protein_names
+HCI002_OLINK_baseline_df <- HCI002_OLINK_baseline_df[, !duplicated(colnames(HCI002_OLINK_baseline_df))]
+
+olink_names <- colnames(HCI002_OLINK_ontreat_df)
+protein_names <- HCI002_map_df$Assay[match(olink_names, HCI002_map_df$OlinkID)]
+colnames(HCI002_OLINK_ontreat_df) <- protein_names
+HCI002_OLINK_ontreat_df <- HCI002_OLINK_ontreat_df[, !duplicated(colnames(HCI002_OLINK_ontreat_df))]
+
+olink_names <- colnames(HCI002_OLINK_FC_on_pre_df)
+protein_names <- HCI002_map_df$Assay[match(olink_names, HCI002_map_df$OlinkID)]
+colnames(HCI002_OLINK_FC_on_pre_df) <- protein_names
+HCI002_OLINK_FC_on_pre_df <- HCI002_OLINK_FC_on_pre_df[, !duplicated(colnames(HCI002_OLINK_FC_on_pre_df))]
+
+# Convert expression data to numeric matrix
+expr_mat <- apply(HCI002_OLINK_FC_on_pre_df, 2, as.numeric)
+
+rownames(expr_mat) <- rownames(HCI002_OLINK_FC_on_pre_df)
+
+# Remove features (proteins) with zero variance
+expr_mat <- expr_mat[, apply(expr_mat, 2, function(x) sd(x, na.rm = TRUE) > 0)]
+
+# Remove samples with >20% missing values
+valid_samples <- rowSums(is.na(expr_mat)) < (0.2 * ncol(expr_mat))
+valid_samples <- valid_samples & (!is.na(irAE_vec))
+expr_mat <- expr_mat[valid_samples, ]
+irAE_vec_clean <- irAE_vec[valid_samples]
+irAE_grade_vec_clean <- irAE_grade_vec[valid_samples]
+ICBR_vec_clean <- ICBR_vec[valid_samples]
+sex_vec_clean <- sex_vec[valid_samples]
+IPIdrug_vec_clean <- IPIdrug_vec[valid_samples]
+
+# Remove completely NA columns
+expr_mat <- expr_mat[, colSums(!is.na(expr_mat)) > 0]
+
+# Phenotype annotation (multiple)
+annotation_df <- data.frame(#irAE = factor(irAE_vec_clean, levels = c(0,1), labels = c("0", "1")),
+                            `irAE grade` = factor(irAE_grade_vec_clean, levels = c("Severe","Moderate","Mild","None")),
+                            Response = factor(ICBR_vec_clean, levels = c(0,1)),
+                            Sex = factor(sex_vec_clean, levels = c("Female","Male")),
+                            Treatment = factor(IPIdrug_vec_clean, levels = c("PD1/PDL1","CTLA4-containing")), check.names = F)
+rownames(annotation_df) <- rownames(expr_mat)
+
+# Calculate row means for expression matrix (samples are rows)
+expr_row_means <- rowMeans(expr_mat, na.rm = TRUE)
+# Create logical vectors for group membership
+severe_idx <- annotation_df$`irAE grade` == "Severe"
+non_severe_idx <- !severe_idx  # includes Moderate, Mild, None
+# Get ordered indices within each group by row mean (descending)
+severe_ordered_idx <- order(expr_row_means[severe_idx], decreasing = TRUE)
+non_severe_ordered_idx <- order(expr_row_means[non_severe_idx], decreasing = TRUE)
+# Combine full index
+ordered_idx <- c(
+  which(severe_idx)[severe_ordered_idx],
+  which(non_severe_idx)[non_severe_ordered_idx]
+)
+# Apply the ordering
+expr_mat_ordered <- expr_mat[ordered_idx, , drop = FALSE]
+annotation_df <- annotation_df[ordered_idx, , drop = FALSE]
+
+
+column_split_vec <- ifelse(annotation_df$`irAE grade` == "Severe", "Severe irAE", "Non-severe irAE")
+column_split_vec <- factor(column_split_vec, levels = c("Severe irAE", "Non-severe irAE"))
+annotation_colors <- list(
+  `irAE grade` = c(
+    "Severe"   = "#D73027",
+    "Moderate" = "#FC8D59",
+    "Mild"     = "#FEE08B",
+    "None"     = "#D9EF8B"
+  ),
+  Response = c("0" = "#91BFDB", "1" = "#4575B4"),
+  Sex = c("Female" = "#E78AC3", "Male" = "#00BFC4"),
+  Treatment = c("PD1/PDL1" = "#A6CEE3", "CTLA4-containing" = "#1F78B4")
+)
+top_anno <- HeatmapAnnotation(
+  df = annotation_df,
+  col = annotation_colors,
+  annotation_legend_param = list(title_gp = gpar(fontsize = 10))
+)
+
+# transpose expr_mat_ordered and rank by fold change between "Severe irAE", "Non-severe irAE" samples
+expr_mat_ordered <- t(expr_mat_ordered)
+irAE_grades <- annotation_df$`irAE grade`
+severe_idx <- which(irAE_grades == "Severe")
+non_severe_idx <- which(irAE_grades != "Severe")
+# Ensure rownames are present
+if (is.null(rownames(expr_mat_ordered))) {
+  stop("expr_mat_ordered must have rownames (e.g., gene/protein names)")
+}
+# Initialize vector to store fold changes
+fc_df <- data.frame(
+  Gene = rownames(expr_mat_ordered),
+  FC = NA_real_,
+  log2_FC = NA_real_,
+  P_value = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+# Calculate fold change (mean Severe / mean Non-Severe)
+for (i in seq_len(nrow(expr_mat_ordered))) {
+  gene_expr <- expr_mat_ordered[i, ]
+  
+  mean_severe <- median(gene_expr[severe_idx], na.rm = TRUE)
+  mean_non_severe <- median(gene_expr[non_severe_idx], na.rm = TRUE)
+  fc <- mean_severe / mean_non_severe
+  log2_fc <- log2(fc)
+  
+  # Wilcoxon test
+  wilcox_res <- wilcox.test(
+    gene_expr[severe_idx], 
+    gene_expr[non_severe_idx], 
+    exact = FALSE
+  )
+  p_val <- wilcox_res$p.value
+  # Store in data frame
+  fc_df[i, c("FC", "log2_FC", "P_value")] <- c(fc, log2_fc, p_val)
+  
+}
+ranked_genes <- fc_df$Gene[order(-fc_df$log2_FC)]
+expr_mat_ordered <- expr_mat_ordered[ranked_genes, ]
+
+# Custom column labels
+label_rows <- which(rownames(expr_scaled_ordered) %in% genes_show)
+gene_mark_anno <- rowAnnotation(
+  Gene = anno_mark(
+    at = label_rows,
+    labels = rownames(expr_scaled_ordered)[label_rows],
+    side = "right",  # or "left"
+    labels_gp = gpar(fontsize = 10),
+    link_width = unit(1, "mm")
+  )
+)
+
+# log2 normalization (of fold change)
+expr_scaled_ordered <- log2(expr_mat_ordered)
+
+# Plot and save heatmap as rastered Pdf
+quantile5 <- quantile(expr_scaled_ordered, 0.05, na.rm=T)[[1]]
+quantile95 <- quantile(expr_scaled_ordered, 0.95, na.rm=T)[[1]]
+expr_scaled_ordered_capped <- pmin(pmax(expr_scaled_ordered, quantile5), quantile95)
+ht <- Heatmap(
+  matrix = expr_scaled_ordered_capped,
+  name = "Log2 (FC)",
+  use_raster = F,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,  # suppress default labels
+  show_column_names = FALSE,
+  row_labels = NULL,       # make sure no conflict
+  column_split = column_split_vec,
+  col = colorRamp2(c(quantile5, 0, quantile95), c("blue", "white", "red")),
+  top_annotation = top_anno,
+  heatmap_legend_param = list(
+    #at = c(quantile5, 0, quantile95),                  # tick positions
+    #labels = c(quantile5, 0, quantile95),       # tick labels
+    title = "Log2 (FC)",                # legend title
+    title_gp = gpar(fontsize = 10),  # title font , fontface = "bold"
+    labels_gp = gpar(fontsize = 10),    # tick label font
+    legend_direction = "horizontal",    # or "vertical"
+    legend_width = unit(4, "cm"),       # for horizontal
+    title_position = "topcenter"        # title above centered
+  )
+) + gene_mark_anno  # append custom row annotation with labels
+pdf(file = paste0(result_figure_dir, "HCI002_OLINK_FC_heatmap.pdf"),
+    width = 8 * 0.9, height = 11 * 0.9, useDingbats = FALSE)
+draw(
+  ht,
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom",
+  padding = unit(c(0.4, 0.4, 0.4, 0.4), "cm")
+)
+dev.off()
+
+```
+
+# Figure 4G. Heatmap of AUCs of different OLINK predictors for different irAEs
+```{r}
+
+timePt_test <- "FC_on_pre" 
+sheet_names <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", "IRAEactionable01") 
+
+file_path <- data_dir
+
+result_df <- NULL
+
+for (sn in sheet_names) {
+  data_raw <- read_excel(file_path, sheet = sn)
+  data_raw <- as.data.frame(data_raw)
+  
+  # Filter and select desired columns
+  data_filtered <- data_raw[grepl(paste0("OLINK_", timePt_test, "$"), data_raw[[1]]), 1:3] 
+  colnames(data_filtered) <- c("Protein", paste0("AUC_", sn), paste0("p_", sn))
+  
+  # Merge iteratively
+  if (is.null(result_df)) {
+    result_df <- data_filtered
+  } else {
+    result_df <- merge(result_df, data_filtered, by = "Protein", all = TRUE)
+  }
+}
+
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+result_df$Protein <- gsub(paste0("_OLINK_", timePt_test), "", result_df$Protein)
+result_df$ProteinName <- proteins_mapping[result_df$Protein]
+result_df <- result_df[!duplicated(result_df$ProteinName), ]
+result_df$irAE_AUC_mean <- rowMeans(result_df[c("AUC_IRAE_GI01", "AUC_IRAE_HB01", "AUC_IRAE_skin01", "AUC_IRAE_MSK01", "AUC_IRAEactionable01")], na.rm = TRUE)
+
+result_df <- result_df[order(-result_df$irAE_AUC_mean), ]
+result_df <- result_df[order(-result_df$AUC_IRAE_GI01), ]
+result_df <- result_df[order(-result_df$AUC_IRAE_HB01), ]
+result_df <- result_df[order(-result_df$AUC_IRAE_skin01), ]
+result_df <- result_df[order(-result_df$AUC_IRAE_MSK01), ]
+result_df <- result_df[order(-result_df$AUC_IRAEactionable01), ]
+
+result_df$ProteinName[1:10]
+
+############ heatmap with significance with *
+genes_show <- c("CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10", "IL12A", "IL21", "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19", "PGF", "CA6", "MIA", "PDCD1", "HLA-DRA") 
+result_AUC_df <- result_df[result_df$ProteinName %in% genes_show, c(2,4,6,8,10, ncol(result_df)-1)] # ,12,14
+result_p_df <- result_df[result_df$ProteinName %in% genes_show, c(3,5,7,9,11, ncol(result_df)-1)] # ,13,15
+
+result_AUC_df$ProteinName[order(-result_AUC_df$AUC_IRAE_GI01)][1:3]
+result_AUC_df$ProteinName[order(-result_AUC_df$AUC_IRAE_HB01)][1:3]
+result_AUC_df$ProteinName[order(-result_AUC_df$AUC_IRAE_skin01)][1:3]
+result_AUC_df$ProteinName[order(-result_AUC_df$AUC_IRAE_MSK01)][1:3]
+result_AUC_df$ProteinName[order(-result_AUC_df$AUC_IRAEactionable01)][1:3]
+
+# Convert data frames to matrices, ensuring matching order
+AUC_matrix <- as.matrix(result_AUC_df[, -ncol(result_AUC_df)])
+rownames(AUC_matrix) <- result_AUC_df$ProteinName
+
+p_matrix <- as.matrix(result_p_df[, -ncol(result_p_df)])
+p_matrix <- apply(p_matrix, 2, as.numeric)  # or use data.matrix() for an entire frame
+rownames(p_matrix) <- result_p_df$ProteinName
+
+# Compute mean AUC per row
+mean_auc <- rowMeans(AUC_matrix, na.rm = TRUE)
+
+# Order protein names by mean AUC descending
+ordered_proteins <- names(sort(mean_auc, decreasing = TRUE))
+
+# Reorder both matrices
+AUC_matrix <- t(AUC_matrix[ordered_proteins, ])
+p_matrix <- t(p_matrix[ordered_proteins, ])
+
+library(ComplexHeatmap)
+library(circlize)
+
+mapping <- c(
+  "AUC_IRAE_GI01"  = "Gastrointestinal",
+  "AUC_IRAE_HB01"  = "Hepatobiliary",
+  "AUC_IRAE_skin01" = "Skin",
+  "AUC_IRAE_MSK01"  = "Musculoskeletal",
+  "AUC_IRAEactionable01"  = "Overall"
+)
+rownames(AUC_matrix) <- mapping[rownames(AUC_matrix)]
+
+# Generate heatmap
+heatmap <- Heatmap(
+  AUC_matrix,
+  name = "AUC",
+  col = colorRamp2(c(min(AUC_matrix, na.rm=TRUE), 0.5, max(AUC_matrix, na.rm=TRUE)), c("blue", "white", "red")),
+  cluster_rows = T,
+  cluster_columns = T,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_side = "left",
+  column_names_side = "bottom",
+  border = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(p_matrix[i, j]) && p_matrix[i, j] < 0.05) {
+      grid.text("*", x = x, y = y, gp = gpar(fontsize = 12))
+    }
+  }
+)
+
+# Save heatmap
+pdf(file = paste0(result_figure_dir, "Heatmap_AUC_pvalue_OLINK_vs_different_irAEs.pdf"), height = 3, width = 7)
+draw(heatmap)
+dev.off()
+
+```
+

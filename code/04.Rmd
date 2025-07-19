@@ -1,0 +1,2164 @@
+---
+title: "Pretreatment blood activated CD8Tcm cells predict severe irAEs"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+####### This script makes the below displays for the paper
+## Figure 3A-E,G-J
+## SFigure 4A-H
+
+```{r setup, include=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+```
+
+# load required package
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(viridis)
+library(tidyr)
+library(pROC)
+library(verification)
+library(reshape2)
+library(ggpubr)
+
+library(dplyr)
+
+library(glmnet)
+library(caret)
+library(ranger)
+library(readr)
+
+library(AnnotationDbi)
+library(org.Hs.eg.db) 
+library(ReactomePA)
+library(enrichplot)
+library(gridExtra)
+library(clusterProfiler)
+library(msigdbr)
+
+library(survival)
+library(survminer)
+library(forestplot)
+library(tidyverse)
+```
+
+
+# parameters and constants and common functions
+```{r}
+
+my.cols <- c("#1c4f27", "#81144e", "#79831e", "#00305d", "#9c1915", "black", "grey", "#f58231", "#e6194b", "#3cb44b", "#42d4f4") 
+
+flow_predictor = "CD8T_CM_tripletORp_ratio" 
+flow_predictor_vec = c(
+  "CD8T_CM_tripletORp_ratio",  # baseline
+  "CD4T_EM", "CD4T_EM_tripletORp_ratio", "CD4TM_tripletORp_ratio",  # baseline
+  "CD8T_EMRA_CD38p_ratio",  # FC
+  "CD8T_KI67p_ratio", "CD4T_KI67p_ratio", "Treg_KI67p_ratio",  # FC
+  "Tregs", "CD4T_Naive"  # baseline
+)
+
+# data frames of AUCs, 95% AUCs for different biomarkers
+# Define datasets and biomarkers
+datasets <- c("HCI002", "HCI001", "Nicolas_FACS", "Nicolas_CyTEK")
+biomarkers <- c(flow_predictor_vec,
+  "CXCL9", "CXCL10", "CXCL11",  # FC
+  "IFNG", "IL17A", "IL10", "IL12A", "IL21"  # FC
+) # , "Integrated_proteins"
+# Function to create empty AUC data frame
+create_auc_df <- function(rows, cols) {
+  df <- matrix(NA, nrow = length(rows), ncol = length(cols),
+               dimnames = list(rows, cols))
+  as.data.frame(df)
+}
+# Create the data frames
+AUC_result_df       <- create_auc_df(datasets, biomarkers)
+AUC_lower_result_df <- create_auc_df(datasets, biomarkers)
+AUC_upper_result_df <- create_auc_df(datasets, biomarkers)
+
+
+# function mapping gene IDs and Symbols
+convert_gene_ids_to_symbols <- function(gene_ids, mapping) {
+  lapply(gene_ids, function(x) {
+    entrez_ids <- unlist(strsplit(x, "/"))
+    gene_symbols <- names(mapping)[match(entrez_ids, mapping)]
+    paste(gene_symbols, collapse = ", ")
+  })
+}
+
+# Create a function to make olink gene names unique
+make_unique <- function(names) {
+  # Initialize an empty vector to store unique names
+  unique_names <- character(length(names))
+  # Create a named vector to count occurrences
+  name_count <- table(names)
+  # Track the current count of each name
+  name_tracker <- setNames(rep(0, length(name_count)), names(name_count))
+  # Iterate over the names and create unique ones
+  for (i in seq_along(names)) {
+    name <- names[i]
+    # If this name is duplicated, append the appropriate number
+    if (name_tracker[name] > 0) {
+      new_name <- paste0(name, "_", name_tracker[name] + 1)
+    } else {
+      new_name <- name
+    }
+    # Assign the unique name
+    unique_names[i] <- new_name
+    # Increment the tracker for this name
+    name_tracker[name] <- name_tracker[name] + 1
+  }
+  return(unique_names)
+}
+
+
+```
+
+# load data
+```{r}
+
+### load HCI002 data
+HCI002_all_info0 <- read_csv(file = paste0(data_dir, "HCI002_all_info_20241008.csv"), name_repair = "minimal") 
+HCI002_map_df = read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+
+### load HCI001 data
+HCI001_all_info0 <- read_csv(file = paste0(data_dir, "HCI001_flow_olink_all_info_flat_20241008.csv"), name_repair = "minimal") 
+HCI001_map_df = read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+
+### load Nicolas data
+Nicolas_all_info0 = read_csv(file = paste0(data_dir, "Nicolas_all_info_flat.csv"), name_repair = "minimal") 
+
+```
+
+
+
+# Data preparation (HCI002)
+```{r}
+
+cell_count_HCI002_df1 = read.csv(file = paste0(data_dir_HCI002, "raw_data/cell_counts_per_sample_baseline_T_subsets.csv"))
+cell_count_HCI002_df2 = read.csv(file = paste0(data_dir_HCI002, "raw_data/cell_counts_per_sample_online_T_subsets.csv"))
+
+cell_count_HCI002_df3 = read.csv(file = paste0(data_dir_HCI002, "raw_data/cell_counts_per_sample_baseline.csv"))
+cell_count_HCI002_df4 = read.csv(file = paste0(data_dir_HCI002, "raw_data/cell_counts_per_sample_ontreat.csv"))
+cell_total_HCI002_df = rbind(cell_count_HCI002_df3,cell_count_HCI002_df4)
+# Combine the data frames
+cell_total_HCI002_df <- bind_rows(cell_count_HCI002_df3, cell_count_HCI002_df4)
+cell_total_HCI002_df[is.na(cell_total_HCI002_df)] <- 0  # Replace all NAs with 0
+cell_count_HCI002_total = rowSums(cell_total_HCI002_df[c(2,4:17,19)])
+cell_count_HCI002_total_CD4T = rowSums(cell_total_HCI002_df[c(4:7)])
+cell_count_HCI002_total_CD8T = rowSums(cell_total_HCI002_df[c(8:11)])
+cell_count_HCI002_total_T = rowSums(cell_total_HCI002_df[c(2,4:11,13,14,17,19)])
+
+# Combine the data frames
+cell_count_HCI002_df = bind_rows(cell_count_HCI002_df1,cell_count_HCI002_df2)
+cell_count_HCI002_df[is.na(cell_count_HCI002_df)] <- 0  # Replace all NAs with 0
+cell_count_HCI002_df$CD4T_EM_HLADRp_ratio = cell_count_HCI002_df$CD4T_EM.HLADRp/cell_count_HCI002_df$CD4T_EM
+cell_count_HCI002_df$CD8T_EM_HLADRp_ratio = cell_count_HCI002_df$CD8T_EM.HLADRp/cell_count_HCI002_df$CD8T_EM
+cell_count_HCI002_df$CD4T_EM_KI67p_ratio = cell_count_HCI002_df$CD4T_EM.KI67p/cell_count_HCI002_df$CD4T_EM
+cell_count_HCI002_df$CD8T_EM_KI67p_ratio = cell_count_HCI002_df$CD8T_EM.KI67p/cell_count_HCI002_df$CD8T_EM
+cell_count_HCI002_df$CD4T_EM_CD38p_ratio = cell_count_HCI002_df$CD4T_EM.CD38p/cell_count_HCI002_df$CD4T_EM
+cell_count_HCI002_df$CD8T_EM_CD38p_ratio = cell_count_HCI002_df$CD8T_EM.CD38p/cell_count_HCI002_df$CD8T_EM
+
+cell_count_HCI002_df$CD8T_KI67p_ratio = rowSums(cell_count_HCI002_df[c("CD8T_Naive.KI67p", "CD8T_CM.KI67p", "CD8T_EM.KI67p", "CD8T_EMRA.KI67p")])/cell_count_HCI002_total_T
+cell_count_HCI002_df$CD4T_KI67p_ratio = rowSums(cell_count_HCI002_df[c("CD4T_Naive.KI67p", "CD4T_CM.KI67p", "CD4T_EM.KI67p", "CD4T_EMRA.KI67p")])/cell_count_HCI002_total_T
+cell_count_HCI002_df$Treg_KI67p_ratio = cell_count_HCI002_df$Tregs.KI67p/cell_count_HCI002_total_T
+cell_count_HCI002_df$CD8T_EMRA_CD38p_ratio = cell_count_HCI002_df$CD8T_EMRA.CD38p/cell_count_HCI002_total_CD8T
+
+cell_count_HCI002_df$CD4T_CM_tripletORp_ratio = cell_count_HCI002_df$CD4T_CM.tripletORp/cell_count_HCI002_df$CD4T_CM
+cell_count_HCI002_df$CD8T_CM_tripletORp_ratio = cell_count_HCI002_df$CD8T_CM.tripletORp/cell_count_HCI002_df$CD8T_CM
+cell_count_HCI002_df$TCM_tripletORp_ratio = rowSums(cell_count_HCI002_df[c("CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_HCI002_df$CD4T_CM + cell_count_HCI002_df$CD8T_CM)
+cell_count_HCI002_df$CD8T_EM_tripletORp_ratio = cell_count_HCI002_df$CD8T_EM.tripletORp/cell_count_HCI002_df$CD8T_EM
+cell_count_HCI002_df$TEM_tripletORp_ratio = rowSums(cell_count_HCI002_df[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp")])/(cell_count_HCI002_df$CD4T_EM + cell_count_HCI002_df$CD8T_EM)
+cell_count_HCI002_df$CD8TM_tripletORp_ratio = (cell_count_HCI002_df$CD8T_EM.tripletORp + cell_count_HCI002_df$CD8T_CM.tripletORp)/cell_count_HCI002_df$CD8T_EM
+cell_count_HCI002_df$TM_tripletORp_ratio = rowSums(cell_count_HCI002_df[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp","CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_HCI002_df$CD4T_EM + cell_count_HCI002_df$CD8T_EM)
+
+cell_count_HCI002_df$CD4T_EM_tripletORp_ratio = cell_count_HCI002_df$CD4T_EM.tripletORp/cell_count_HCI002_total
+cell_count_HCI002_df$CD4TM_tripletORp_ratio = (cell_count_HCI002_df$CD4T_EM.tripletORp + cell_count_HCI002_df$CD4T_CM.tripletORp)/cell_count_HCI002_total
+
+cell_count_HCI002_df$CD4T_EM_tripletANDp_ratio = cell_count_HCI002_df$CD4T_EM.tripletANDp/cell_count_HCI002_df$CD4T_EM
+cell_count_HCI002_df$CD8T_EM_tripletANDp_ratio = cell_count_HCI002_df$CD8T_EM.tripletANDp/cell_count_HCI002_df$CD8T_EM
+cell_count_HCI002_df$TEM_tripletANDp_ratio = rowSums(cell_count_HCI002_df[c("CD4T_EM.tripletANDp", "CD8T_EM.tripletANDp")])/rowSums(cell_count_HCI002_df[c("CD4T_EM", "CD8T_EM")])
+
+cell_count_HCI002_df$CD4T_EM_tripletORp_fake_ratio = cell_count_HCI002_df$CD4T_EM_HLADRp_ratio + cell_count_HCI002_df$CD4T_EM_KI67p_ratio + cell_count_HCI002_df$CD4T_EM_CD38p_ratio
+cell_count_HCI002_df$CD8T_EM_tripletORp_fake_ratio = cell_count_HCI002_df$CD8T_EM_HLADRp_ratio + cell_count_HCI002_df$CD8T_EM_KI67p_ratio + cell_count_HCI002_df$CD8T_EM_CD38p_ratio
+cell_count_HCI002_df$TEM_tripletORp_fake_ratio = cell_count_HCI002_df$CD4T_EM_tripletORp_fake_ratio + cell_count_HCI002_df$CD8T_EM_tripletORp_fake_ratio
+
+cell_count_HCI002_df$sample_id = gsub("_nonGRAN", "", cell_count_HCI002_df$sample_id)
+### meta data
+metadata_df1 = read.csv(paste0(data_dir_HCI002, "raw_data/baseline_processed_metadata.csv")) 
+metadata_df2 = read.csv(paste0(data_dir_HCI002, "raw_data/on_treatment_processed_metadata.csv")) 
+metadata_df = rbind(metadata_df1,metadata_df2)
+
+cell_count_HCI002_df = merge(cell_count_HCI002_df, metadata_df, by.x = "sample_id", by.y = "FCS.Filename")
+cell_count_HCI002_df = cell_count_HCI002_df[c("Sample.ID", flow_predictor_vec)]
+cell_count_HCI002_df = cell_count_HCI002_df[cell_count_HCI002_df$Sample.ID!="",]
+##  phenotype data
+phenotype_all = read_excel(paste0(data_dir_HCI002, "HCI002 Teiko clinical info 7.12.23_clean.xlsx"))
+phenotype_all$Sample.ID = phenotype_all$`Vial ID`
+phenotype_all$patient_therapy = paste(phenotype_all$`Record ID`, phenotype_all$`Systemic Therapy Name`, phenotype_all$`Systemic Therapy Type`, sep = "_")
+
+cell_count_HCI002_df = merge(phenotype_all, cell_count_HCI002_df, by = "Sample.ID")
+cell_count_HCI002_df = cell_count_HCI002_df[c("patient_therapy","Timepoint [eg. baseline, day X post therarpy]", flow_predictor_vec)]
+colnames(cell_count_HCI002_df)[2] = "Timepoint"
+
+cell_count_HCI002_df_baseline = cell_count_HCI002_df[grepl("Pre|pre", cell_count_HCI002_df$Timepoint),]
+cell_count_HCI002_df_baseline$Timepoint = NULL
+cell_count_HCI002_df_preIRAE = cell_count_HCI002_df[grepl("on|On", cell_count_HCI002_df$Timepoint),]
+cell_count_HCI002_df_preIRAE$Timepoint = NULL
+
+colnames(cell_count_HCI002_df_baseline)[-1] = paste0(colnames(cell_count_HCI002_df_baseline)[-1], "_baseline")
+colnames(cell_count_HCI002_df_preIRAE)[-1] = paste0(colnames(cell_count_HCI002_df_preIRAE)[-1], "_ontreat")
+
+HCI002_all_info = merge(HCI002_all_info0, cell_count_HCI002_df_baseline, by = "patient_therapy", all.x = T)
+HCI002_all_info = merge(HCI002_all_info, cell_count_HCI002_df_preIRAE, by = "patient_therapy", all.x = T)
+
+```
+
+# Data preparation (HCI002)
+```{r}
+
+AUC_irAEs_df_HCI002 = data.frame(irAE_type = c("IRAEgrade01", "minIRAEgrade01", "IRAEactionable01", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01"),
+                          irAE_AUC = c(NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_lower = c(NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_upper = c(NA, NA, NA, NA, NA, NA, NA),
+                          irAE_pval = c(NA, NA, NA, NA, NA, NA, NA))
+
+timePt = "baseline" # baseline ontreat 
+
+flow_features = flow_predictor 
+flow_features = paste(flow_features, timePt, sep = "_")
+Olink_features = c("CXCL9_OLINK", "CXCL10_OLINK", "CXCL11_OLINK", "IFNG_OLINK", "IL17A_OLINK", "IL10_OLINK", "IL12A_OLINK", "IL21_OLINK")
+Olink_features = paste(Olink_features, timePt, sep = "_")
+
+phenotype <- "IRAEactionable01" 
+
+### HCI002
+HCI002_all_info$CD8T_EMRA_CD38p_ratio_FC <- HCI002_all_info$CD8T_EMRA_CD38p_ratio_ontreat / (HCI002_all_info$CD8T_EMRA_CD38p_ratio_baseline + 0.000001)
+HCI002_all_info$CD8T_KI67p_ratio_FC <- HCI002_all_info$CD8T_KI67p_ratio_ontreat / (HCI002_all_info$CD8T_KI67p_ratio_baseline + 0.000001)
+HCI002_all_info$CD4T_KI67p_ratio_FC <- HCI002_all_info$CD4T_KI67p_ratio_ontreat / (HCI002_all_info$CD4T_KI67p_ratio_baseline + 0.000001)
+HCI002_all_info$Treg_KI67p_ratio_FC <- HCI002_all_info$Treg_KI67p_ratio_ontreat / (HCI002_all_info$Treg_KI67p_ratio_baseline + 0.000001)
+
+HCI002_timePt_info = HCI002_all_info[grepl(paste0("_",timePt, "|_FC$"), colnames(HCI002_all_info), ignore.case = T)] # 1001+1472 = 2473 features
+HCI002_timePt_info = cbind(HCI002_timePt_info, HCI002_all_info[c("IRAEgrade01", "minIRAEgrade01", "IRAEactionable01", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", "RECIST01", "Response01")])
+olink_names = colnames(HCI002_timePt_info)[grepl("OID", colnames(HCI002_timePt_info))]
+olink_names <- sub("_.*", "", olink_names)
+protein_names <- HCI002_map_df$Assay[match(olink_names, HCI002_map_df$OlinkID)]
+unique_protein_names <- make_unique(protein_names)
+unique_protein_names = paste0(unique_protein_names, paste0("_OLINK_",timePt))
+colnames(HCI002_timePt_info)[grepl("OID", colnames(HCI002_timePt_info))] = unique_protein_names
+
+Olink_features %in% colnames(HCI002_timePt_info)
+Olink_features_measured = Olink_features[Olink_features %in% colnames(HCI002_timePt_info)]
+
+response <- HCI002_timePt_info[[phenotype]]
+
+#### compare AUCs of different biomarkers
+all_single_predictors <- c(paste(flow_predictor_vec, timePt, sep = "_"), Olink_features)
+all_single_predictors[2] <- "CD4_TEM_FC_baselineL2"
+all_single_predictors[5] <- "CD8T_EMRA_CD38p_ratio_FC"
+all_single_predictors[6] <- "CD8T_KI67p_ratio_FC"
+all_single_predictors[7] <- "CD4T_KI67p_ratio_FC"
+all_single_predictors[8] <- "Treg_KI67p_ratio_FC"
+all_single_predictors[9] <- "TREG_FC_baselineL2"
+all_single_predictors[10] <- "CD4_TNAIVE_FC_baselineL2"
+
+all_single_predictors %in% colnames(HCI002_timePt_info)
+
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(HCI002_timePt_info)){
+    predictor <- HCI002_timePt_info[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC_ci <- ci.auc(roc_obj)
+    AUC_vec = c(AUC_vec, AUC_ci[2])
+    AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+    AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+    AUC_low_vec = c(AUC_low_vec, NA)
+    AUC_up_vec = c(AUC_up_vec, NA)
+  }
+}
+
+AUC_result_df["HCI002", ] = AUC_vec
+AUC_lower_result_df["HCI002", ] = AUC_low_vec
+AUC_upper_result_df["HCI002", ] = AUC_up_vec
+
+
+
+#### compare AUCs of different IRAE phenotypes
+phenotype_vec = c("IRAEgrade01", "minIRAEgrade01", "IRAEactionable01", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01")
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+p_vec = c()
+for (pt in phenotype_vec){
+  response <- HCI002_timePt_info[[pt]]
+  predictor <- rowSums(HCI002_timePt_info[flow_features]) 
+  roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+  AUC_ci <- ci.auc(roc_obj)
+  AUC_vec = c(AUC_vec, AUC_ci[2])
+  AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+  AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  auc_p=roc.area(response, predictor)
+  p_val = auc_p$p.value
+  p_vec = c(p_vec, p_val)
+}
+AUC_irAEs_df_HCI002$irAE_AUC = AUC_vec
+AUC_irAEs_df_HCI002$irAE_AUC_lower = AUC_low_vec
+AUC_irAEs_df_HCI002$irAE_AUC_upper = AUC_up_vec
+AUC_irAEs_df_HCI002$irAE_pval = p_vec
+
+response <- HCI002_timePt_info$IRAEactionable01
+
+predictor2 <- rowSums(HCI002_timePt_info[flow_features]) 
+
+HCI002_predict_df = data.frame(phenotype = response, feature = predictor2)
+HCI002_predict_ICB_df = data.frame(phenotype = HCI002_timePt_info$Response01, feature = predictor2)
+
+```
+
+# Figure 3G. Heatmap of AUCs of different  predictors for different irAEs (in HCI002)
+```{r}
+
+# Define phenotype names
+pheno_names <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", 
+                 "IRAEactionable01", "RECIST01", "Response01")
+
+# Initialize result data frames
+auc_matrix <- matrix(NA, nrow = length(all_single_predictors), ncol = length(pheno_names),
+                     dimnames = list(all_single_predictors, pheno_names))
+pval_matrix <- matrix(NA, nrow = length(all_single_predictors), ncol = length(pheno_names),
+                      dimnames = list(all_single_predictors, pheno_names))
+
+# Iterate through phenotypes and predictors
+for (pheno in pheno_names) {
+  pheno_vec <- HCI002_timePt_info[[pheno]]
+  
+  for (sp in all_single_predictors) {
+    if (sp %in% colnames(HCI002_timePt_info)) {
+      predictor <- HCI002_timePt_info[[sp]]
+      
+      # Compute ROC, AUC, and p-value
+      roc_result <- roc(pheno_vec, predictor, direction = "<", levels = c(0, 1), quiet = TRUE)
+      auc_val <- as.numeric(roc_result$auc)
+      
+      # Compare to a null model with AUC=0.5
+      null_roc <- roc(pheno_vec, rep(0.5, length(pheno_vec)), quiet = TRUE)
+      suppressMessages({
+        roc_test <- roc.test(roc_result, null_roc, method = "delong")
+      })
+      auc_pval <- roc_test$p.value
+      
+    } else {
+      auc_val <- NA
+      auc_pval <- NA
+    }
+    
+    # Store results
+    auc_matrix[sp, pheno] <- auc_val
+    pval_matrix[sp, pheno] <- auc_pval
+  }
+}
+
+# Convert to data frames
+result_AUC_df <- as.data.frame(auc_matrix[c(1:8,10),])
+result_p_df <- as.data.frame(pval_matrix[c(1:8,10),])
+
+# print the top three predictors of each irAE type
+rownames(result_AUC_df)[order(-result_AUC_df$IRAE_GI01)][1:3]
+rownames(result_AUC_df)[order(-result_AUC_df$IRAE_HB01)][1:3]
+rownames(result_AUC_df)[order(-result_AUC_df$IRAE_skin01)][1:3]
+rownames(result_AUC_df)[order(-result_AUC_df$IRAE_MSK01)][1:3]
+rownames(result_AUC_df)[order(-result_AUC_df$IRAEactionable01)][1:3]
+
+# Convert data frames to matrices, ensuring matching order
+AUC_matrix <- as.matrix(result_AUC_df)
+rownames(AUC_matrix) <- rownames(result_AUC_df)
+
+p_matrix <- as.matrix(result_p_df)
+p_matrix <- apply(p_matrix, 2, as.numeric)  # or use data.matrix() for an entire frame
+rownames(p_matrix) <- result_p_df$ProteinName
+
+# Reorder both matrices
+AUC_matrix <- t(AUC_matrix)
+p_matrix <- t(p_matrix)
+
+library(ComplexHeatmap)
+library(circlize)
+
+mapping <- c(
+  "IRAE_GI01"  = "Gastrointestinal",
+  "IRAE_HB01"  = "Hepatobiliary",
+  "IRAE_skin01" = "Skin",
+  "IRAE_MSK01"  = "Musculoskeletal",
+  "IRAEactionable01"  = "Overall",
+  "RECIST01"  = "RECIST",
+  "Response01"  = "Clinical"
+)
+rownames(AUC_matrix) <- mapping[rownames(AUC_matrix)]
+
+mapping <- c(
+  "CD8T_CM_tripletORp_ratio_baseline"   = "Activated CD8Tcm",
+  "CD8T_KI67p_ratio_FC"           = "Ki67+ CD8T",
+  "CD4_TNAIVE_FC_baselineL2"                 = "Naive CD4T",
+  "CD4T_KI67p_ratio_FC"           = "Ki67+ CD4T",
+  "Treg_KI67p_ratio_FC"           = "Ki67+ Treg",
+  "CD4TM_tripletORp_ratio_baseline"     = "Activated CD4Tm",
+  "CD8T_EMRA_CD38p_ratio_FC"      = "CD38+ CD8Temra",
+  "CD4T_EM_tripletORp_ratio_baseline"   = "Activated CD4Tem",
+  "CD4_TEM_FC_baselineL2"                    = "CD4Tem"
+)
+colnames(AUC_matrix) <- mapping[colnames(AUC_matrix)]
+
+# remove response
+AUC_matrix <- AUC_matrix[1:5,]
+
+AUC_matrix <- t(AUC_matrix)
+p_matrix <- t(p_matrix)
+
+# Generate heatmap
+heatmap <- Heatmap(
+  AUC_matrix,
+  name = "AUC",
+  col = colorRamp2(c(min(AUC_matrix, na.rm=TRUE), 0.5, max(AUC_matrix, na.rm=TRUE)), c("blue", "white", "red")),
+  cluster_rows = T,
+  cluster_columns = T,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_side = "left",
+  column_names_side = "bottom",
+  border = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(p_matrix[i, j]) && p_matrix[i, j] < 0.05) {
+      grid.text("*", x = x, y = y, gp = gpar(fontsize = 12))
+    }
+  }
+)
+
+# Save heatmap
+pdf(file = paste0(result_figure_dir, "Heatmap_AUC_pvalue_CyTOF_vs_different_irAEs.pdf"), height = 4, width = 3.5)
+draw(heatmap)
+dev.off()
+
+```
+
+
+# Data preparation (HCI001)
+```{r}
+
+data_dir_HCI001 = "/Users/changt7/Documents/00.PostDocWork/CancerResearch/01.Projects/00.Collaborating_projects/10.UUtahPIVOTCenter_Siwen/02.Input/Siwen_mainCohort/HCI001/"
+cell_count_HCI001_df = read.csv(file = paste0(data_dir_HCI001, "raw_data/cell_counts_per_sample_T_subsets.csv"))
+
+cell_count_HCI001_df2 = read.csv(file = paste0(data_dir_HCI001, "raw_data/cell_counts_per_sample.csv"))
+cell_count_HCI001_total = rowSums(cell_count_HCI001_df2[c(2,4:17,20)])
+cell_count_HCI001_total_CD4T = rowSums(cell_count_HCI001_df2[c(4:7)])
+cell_count_HCI001_total_CD8T = rowSums(cell_count_HCI001_df2[c(8:11)])
+cell_count_HCI001_total_T = rowSums(cell_count_HCI001_df2[c(2,4:11,13,14,17,20)])
+
+cell_count_HCI001_df$CD4T_EM_HLADRp_ratio = cell_count_HCI001_df$CD4T_EM.HLADRp/cell_count_HCI001_df$CD4T_EM
+cell_count_HCI001_df$CD8T_EM_HLADRp_ratio = cell_count_HCI001_df$CD8T_EM.HLADRp/cell_count_HCI001_df$CD8T_EM
+cell_count_HCI001_df$CD4T_EM_KI67p_ratio = cell_count_HCI001_df$CD4T_EM.KI67p/cell_count_HCI001_df$CD4T_EM
+cell_count_HCI001_df$CD8T_EM_KI67p_ratio = cell_count_HCI001_df$CD8T_EM.KI67p/cell_count_HCI001_df$CD8T_EM
+cell_count_HCI001_df$CD4T_EM_CD38p_ratio = cell_count_HCI001_df$CD4T_EM.CD38p/cell_count_HCI001_df$CD4T_EM
+cell_count_HCI001_df$CD8T_EM_CD38p_ratio = cell_count_HCI001_df$CD8T_EM.CD38p/cell_count_HCI001_df$CD8T_EM
+
+cell_count_HCI001_df$CD8T_KI67p_ratio = rowSums(cell_count_HCI001_df[c("CD8T_Naive.KI67p", "CD8T_CM.KI67p", "CD8T_EM.KI67p", "CD8T_EMRA.KI67p")])/cell_count_HCI001_total_T
+cell_count_HCI001_df$CD4T_KI67p_ratio = rowSums(cell_count_HCI001_df[c("CD4T_Naive.KI67p", "CD4T_CM.KI67p", "CD4T_EM.KI67p", "CD4T_EMRA.KI67p")])/cell_count_HCI001_total_T
+cell_count_HCI001_df$Treg_KI67p_ratio = cell_count_HCI001_df$Tregs.KI67p/cell_count_HCI001_total_T
+cell_count_HCI001_df$CD8T_EMRA_CD38p_ratio = cell_count_HCI001_df$CD8T_EMRA.CD38p/cell_count_HCI001_total_CD8T
+
+cell_count_HCI001_df$CD4T_CM_tripletORp_ratio = cell_count_HCI001_df$CD4T_CM.tripletORp/cell_count_HCI001_df$CD4T_CM
+cell_count_HCI001_df$CD8T_CM_tripletORp_ratio = cell_count_HCI001_df$CD8T_CM.tripletORp/cell_count_HCI001_df$CD8T_CM
+cell_count_HCI001_df$TCM_tripletORp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_HCI001_df$CD4T_CM + cell_count_HCI001_df$CD8T_CM)
+#cell_count_HCI001_df$CD4T_EM_tripletORp_ratio = cell_count_HCI001_df$CD4T_EM.tripletORp/cell_count_HCI001_df$CD4T_EM
+cell_count_HCI001_df$CD8T_EM_tripletORp_ratio = cell_count_HCI001_df$CD8T_EM.tripletORp/cell_count_HCI001_df$CD8T_EM
+cell_count_HCI001_df$TEM_tripletORp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp")])/(cell_count_HCI001_df$CD4T_EM + cell_count_HCI001_df$CD8T_EM)
+#cell_count_HCI001_df$CD4TM_tripletORp_ratio = (cell_count_HCI001_df$CD4T_EM.tripletORp + cell_count_HCI001_df$CD4T_CM.tripletORp)/cell_count_HCI001_df$CD4T_EM
+cell_count_HCI001_df$CD8TM_tripletORp_ratio = (cell_count_HCI001_df$CD8T_EM.tripletORp + cell_count_HCI001_df$CD8T_CM.tripletORp)/cell_count_HCI001_df$CD8T_EM
+cell_count_HCI001_df$TM_tripletORp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp","CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_HCI001_df$CD4T_EM + cell_count_HCI001_df$CD8T_EM)
+
+# cell_count_HCI001_df$CD4T_CM_tripletORp_ratio = cell_count_HCI001_df$CD4T_CM.tripletORp/cell_count_HCI001_total
+# cell_count_HCI001_df$CD8T_CM_tripletORp_ratio = cell_count_HCI001_df$CD8T_CM.tripletORp/cell_count_HCI001_total
+# cell_count_HCI001_df$TCM_tripletORp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/cell_count_HCI001_total
+cell_count_HCI001_df$CD4T_EM_tripletORp_ratio = cell_count_HCI001_df$CD4T_EM.tripletORp/cell_count_HCI001_total
+# cell_count_HCI001_df$CD8T_EM_tripletORp_ratio = cell_count_HCI001_df$CD8T_EM.tripletORp/cell_count_HCI001_total
+# cell_count_HCI001_df$TEM_tripletORp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp")])/cell_count_HCI001_total
+cell_count_HCI001_df$CD4TM_tripletORp_ratio = (cell_count_HCI001_df$CD4T_EM.tripletORp + cell_count_HCI001_df$CD4T_CM.tripletORp)/cell_count_HCI001_total
+# cell_count_HCI001_df$CD8TM_tripletORp_ratio = (cell_count_HCI001_df$CD8T_EM.tripletORp + cell_count_HCI001_df$CD8T_CM.tripletORp)/cell_count_HCI001_total
+# cell_count_HCI001_df$TM_tripletORp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp","CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/cell_count_HCI001_total
+
+
+cell_count_HCI001_df$CD4T_EM_tripletANDp_ratio = cell_count_HCI001_df$CD4T_EM.tripletANDp/cell_count_HCI001_df$CD4T_EM
+cell_count_HCI001_df$CD8T_EM_tripletANDp_ratio = cell_count_HCI001_df$CD8T_EM.tripletANDp/cell_count_HCI001_df$CD8T_EM
+cell_count_HCI001_df$TEM_tripletANDp_ratio = rowSums(cell_count_HCI001_df[c("CD4T_EM.tripletANDp", "CD8T_EM.tripletANDp")])/rowSums(cell_count_HCI001_df[c("CD4T_EM", "CD8T_EM")])
+
+cell_count_HCI001_df$CD4T_EM_tripletORp_fake_ratio = cell_count_HCI001_df$CD4T_EM_HLADRp_ratio + cell_count_HCI001_df$CD4T_EM_KI67p_ratio + cell_count_HCI001_df$CD4T_EM_CD38p_ratio
+cell_count_HCI001_df$CD8T_EM_tripletORp_fake_ratio = cell_count_HCI001_df$CD8T_EM_HLADRp_ratio + cell_count_HCI001_df$CD8T_EM_KI67p_ratio + cell_count_HCI001_df$CD8T_EM_CD38p_ratio
+cell_count_HCI001_df$TEM_tripletORp_fake_ratio = cell_count_HCI001_df$CD4T_EM_tripletORp_fake_ratio + cell_count_HCI001_df$CD8T_EM_tripletORp_fake_ratio
+cell_count_HCI001_df = cell_count_HCI001_df[c("sample_id", flow_predictor_vec)] # CD8T_EM_tripletORp_ratio
+### meta data
+metadata_df = read.csv(paste0(data_dir_HCI001, "raw_data/HCI001-Annotations.csv")) 
+cell_count_HCI001_df = merge(cell_count_HCI001_df, metadata_df, by.x = "sample_id", by.y = "Filename")
+cell_count_HCI001_df = cell_count_HCI001_df[c("sample.id", flow_predictor_vec)]
+cell_count_HCI001_df = cell_count_HCI001_df[cell_count_HCI001_df$sample.id!="",]
+##  phenotype data
+phenotype_all = read_excel(paste0(data_dir_HCI001, "HCI001 clinical data 11.15.22 updated 4.15.24.xlsx"))
+phenotype_all$sample.id = phenotype_all$`CyTOF (Vial ID)`
+
+cell_count_HCI001_df = merge(phenotype_all, cell_count_HCI001_df, by = "sample.id")
+cell_count_HCI001_df = cell_count_HCI001_df[c("RedCap ID","Timepoint", flow_predictor_vec)]
+
+cell_count_HCI001_df_baseline = cell_count_HCI001_df[grepl("aseline", cell_count_HCI001_df$Timepoint),]
+cell_count_HCI001_df_baseline$Timepoint = NULL
+cell_count_HCI001_df_preIRAE = cell_count_HCI001_df[grepl("pre|Pre", cell_count_HCI001_df$Timepoint),]
+cell_count_HCI001_df_preIRAE$Timepoint = NULL
+cell_count_HCI001_df_maxIRAE = cell_count_HCI001_df[grepl("max", cell_count_HCI001_df$Timepoint),]
+cell_count_HCI001_df_maxIRAE$Timepoint = NULL
+cell_count_HCI001_df_postIRAE = cell_count_HCI001_df[grepl("post|Post", cell_count_HCI001_df$Timepoint),]
+cell_count_HCI001_df_postIRAE$Timepoint = NULL
+
+dim(cell_count_HCI001_df_baseline)
+length(unique(cell_count_HCI001_df_baseline$`RedCap ID`))
+dim(cell_count_HCI001_df_preIRAE)
+length(unique(cell_count_HCI001_df_preIRAE$`RedCap ID`))
+dim(cell_count_HCI001_df_maxIRAE)
+length(unique(cell_count_HCI001_df_maxIRAE$`RedCap ID`))
+dim(cell_count_HCI001_df_postIRAE)
+length(unique(cell_count_HCI001_df_postIRAE$`RedCap ID`))
+
+colnames(cell_count_HCI001_df_baseline)[-1] = paste0(colnames(cell_count_HCI001_df_baseline)[-1], "_Baseline")
+colnames(cell_count_HCI001_df_preIRAE)[-1] = paste0(colnames(cell_count_HCI001_df_preIRAE)[-1], "_pre_irAE")
+colnames(cell_count_HCI001_df_maxIRAE)[-1] = paste0(colnames(cell_count_HCI001_df_maxIRAE)[-1], "_irAEmax")
+colnames(cell_count_HCI001_df_postIRAE)[-1] = paste0(colnames(cell_count_HCI001_df_postIRAE)[-1], "_post_irAE")
+
+HCI001_all_info = merge(HCI001_all_info0, cell_count_HCI001_df_baseline, by = "RedCap ID", all.x = T)
+HCI001_all_info = merge(HCI001_all_info, cell_count_HCI001_df_preIRAE, by = "RedCap ID", all.x = T)
+HCI001_all_info = merge(HCI001_all_info, cell_count_HCI001_df_maxIRAE, by = "RedCap ID", all.x = T)
+HCI001_all_info = merge(HCI001_all_info, cell_count_HCI001_df_postIRAE, by = "RedCap ID", all.x = T)
+
+```
+
+# Data preparation (HCI001)
+```{r}
+
+AUC_irAEs_df_HCI001 = data.frame(irAE_type = c("IRAEgrade01", "minIRAEgrade01", "IRAEactionable01", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01"),
+                          irAE_AUC = c(NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_lower = c(NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_upper = c(NA, NA, NA, NA, NA, NA, NA),
+                          irAE_pval = c(NA, NA, NA, NA, NA, NA, NA))
+
+timePt = "Baseline" # Baseline irAEmax 
+
+flow_features = flow_predictor 
+flow_features = paste(flow_features, timePt, sep = "_")
+Olink_features = c("CXCL9_OLINK", "CXCL10_OLINK", "CXCL11_OLINK", "IFNG_OLINK", "IL17A_OLINK", "IL10_OLINK", "IL12A_OLINK", "IL21_OLINK")
+Olink_features = paste(Olink_features, timePt, sep = "_")
+phenotype <- "IRAEactionable01" 
+
+### HCI001
+HCI001_all_info$CD8T_EMRA_CD38p_ratio_FC <- HCI001_all_info$CD8T_EMRA_CD38p_ratio_irAEmax / (HCI001_all_info$CD8T_EMRA_CD38p_ratio_Baseline + 0.000001)
+HCI001_all_info$CD8T_KI67p_ratio_FC <- HCI001_all_info$CD8T_KI67p_ratio_irAEmax / (HCI001_all_info$CD8T_KI67p_ratio_Baseline + 0.000001)
+HCI001_all_info$CD4T_KI67p_ratio_FC <- HCI001_all_info$CD4T_KI67p_ratio_irAEmax / (HCI001_all_info$CD4T_KI67p_ratio_Baseline + 0.000001)
+HCI001_all_info$Treg_KI67p_ratio_FC <- HCI001_all_info$Treg_KI67p_ratio_irAEmax / (HCI001_all_info$Treg_KI67p_ratio_Baseline + 0.000001)
+
+HCI001_timePt_info = HCI001_all_info[grepl(paste0("_",timePt, "|_FC$"), colnames(HCI001_all_info), ignore.case = T)]
+
+HCI001_timePt_info = cbind(HCI001_timePt_info, HCI001_all_info[c("IRAEgrade01", "minIRAEgrade01", "IRAEactionable01", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", "RECIST01")])
+olink_names = colnames(HCI001_timePt_info)[grepl("OID", colnames(HCI001_timePt_info))]
+olink_names <- sub("_.*", "", olink_names)
+protein_names <- HCI001_map_df$Assay[match(olink_names, HCI001_map_df$OlinkID)]
+unique_protein_names <- make_unique(protein_names)
+unique_protein_names = paste0(unique_protein_names, paste0("_OLINK_",timePt))
+colnames(HCI001_timePt_info)[grepl("OID", colnames(HCI001_timePt_info))] = unique_protein_names
+
+Olink_features %in% colnames(HCI001_timePt_info)
+Olink_features_measured = Olink_features[Olink_features %in% colnames(HCI001_timePt_info)]
+
+response <- HCI001_timePt_info[[phenotype]]
+
+#### compare AUCs of different biomarkers
+all_single_predictors <- c(paste(flow_predictor_vec, timePt, sep = "_"), Olink_features)
+all_single_predictors[2] <- "CD4_TEM_Baseline"
+all_single_predictors[5] <- "CD8T_EMRA_CD38p_ratio_FC"
+all_single_predictors[6] <- "CD8T_KI67p_ratio_FC"
+all_single_predictors[7] <- "CD4T_KI67p_ratio_FC"
+all_single_predictors[8] <- "Treg_KI67p_ratio_FC"
+all_single_predictors[9] <- "TREG_Baseline"
+all_single_predictors[10] <- "CD4_TNAIVE_Baseline"
+
+all_single_predictors %in% colnames(HCI001_timePt_info)
+
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(HCI001_timePt_info)){
+    predictor <- HCI001_timePt_info[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC_ci <- ci.auc(roc_obj)
+    AUC_vec = c(AUC_vec, AUC_ci[2])
+    AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+    AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+    AUC_low_vec = c(AUC_low_vec, NA)
+    AUC_up_vec = c(AUC_up_vec, NA)
+  }
+}
+
+AUC_result_df["HCI001", ] = AUC_vec
+AUC_lower_result_df["HCI001", ] = AUC_low_vec
+AUC_upper_result_df["HCI001", ] = AUC_up_vec
+
+
+predictor2 <- rowSums(HCI001_timePt_info[flow_features]) 
+
+HCI001_predict_df = data.frame(phenotype = response, feature = predictor2)
+
+```
+
+# Data preparation (Nunez 1 cohort, FACS)
+```{r}
+
+### annotated cell abundance
+cell_count_Nicolas1 = read.csv(file = paste0(data_dir_Nicolas_discovery_FACS_1st, "cell_counts_per_sample_T_subsets.csv")) 
+cell_count_Nicolas2 <- read.csv(file = paste0(data_dir_Nicolas_discovery_FACS_2nd, "cell_counts_per_sample_T_subsets.csv"))
+# Combine the data frames
+cell_count_Nicolas <- bind_rows(cell_count_Nicolas1, cell_count_Nicolas2)
+cell_count_Nicolas[is.na(cell_count_Nicolas)] <- 0  # Replace all NAs with 0
+
+cell_count_Nicolas3 = read.csv(file = paste0(data_dir_Nicolas_discovery_FACS_1st, "cell_counts_per_sample.csv"))
+cell_count_Nicolas4 = read.csv(file = paste0(data_dir_Nicolas_discovery_FACS_2nd, "cell_counts_per_sample.csv"))
+# Combine the data frames
+cell_total_Nicolas <- bind_rows(cell_count_Nicolas3, cell_count_Nicolas4)
+cell_total_Nicolas[is.na(cell_total_Nicolas)] <- 0  # Replace all NAs with 0
+cell_count_Nicolas_total = rowSums(cell_total_Nicolas[c(2:12,14)])
+cell_count_Nicolas_total_CD4T = rowSums(cell_total_Nicolas[c(2:5)])
+cell_count_Nicolas_total_CD8T = rowSums(cell_total_Nicolas[c(6:9)])
+cell_count_Nicolas_total_T = cell_count_Nicolas_total
+
+cell_count_Nicolas$CD4T_CM_HLADRp_ratio = cell_count_Nicolas$CD4T_CM.HLADRp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_HLADRp_ratio = cell_count_Nicolas$CD8T_CM.HLADRp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$CD4T_CM_KI67p_ratio = cell_count_Nicolas$CD4T_CM.KI67p/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_KI67p_ratio = cell_count_Nicolas$CD8T_CM.KI67p/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$CD4T_CM_CD38p_ratio = cell_count_Nicolas$CD4T_CM.CD38p/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_CD38p_ratio = cell_count_Nicolas$CD8T_CM.CD38p/cell_count_Nicolas$CD8T_CM
+
+cell_count_Nicolas$CD8T_KI67p_ratio = rowSums(cell_count_Nicolas[c("CD8T_Naive.KI67p", "CD8T_CM.KI67p", "CD8T_EM.KI67p", "CD8T_EMRA.KI67p")])/cell_count_Nicolas_total_T
+cell_count_Nicolas$CD4T_KI67p_ratio = rowSums(cell_count_Nicolas[c("CD4T_Naive.KI67p", "CD4T_CM.KI67p", "CD4T_EM.KI67p", "CD4T_EMRA.KI67p")])/cell_count_Nicolas_total_T
+cell_count_Nicolas$Treg_KI67p_ratio = cell_count_Nicolas$Tregs.KI67p/cell_count_Nicolas_total_T
+cell_count_Nicolas$CD8T_EMRA.CD38p = NA
+cell_count_Nicolas$CD8T_EMRA_CD38p_ratio = cell_count_Nicolas$CD8T_EMRA.CD38p/cell_count_Nicolas_total_CD8T
+
+cell_count_Nicolas$CD4T_CM_tripletORp_ratio = cell_count_Nicolas$CD4T_CM.tripletORp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_tripletORp_ratio = cell_count_Nicolas$CD8T_CM.tripletORp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$TCM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_Nicolas$CD4T_CM + cell_count_Nicolas$CD8T_CM)
+cell_count_Nicolas$CD8T_EM_tripletORp_ratio = cell_count_Nicolas$CD8T_EM.tripletORp/cell_count_Nicolas$CD8T_EM
+cell_count_Nicolas$TEM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp")])/(cell_count_Nicolas$CD4T_EM + cell_count_Nicolas$CD8T_EM)
+cell_count_Nicolas$CD8TM_tripletORp_ratio = (cell_count_Nicolas$CD8T_EM.tripletORp + cell_count_Nicolas$CD8T_CM.tripletORp)/cell_count_Nicolas$CD8T_EM
+cell_count_Nicolas$TM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp","CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_Nicolas$CD4T_EM + cell_count_Nicolas$CD8T_EM)
+
+cell_count_Nicolas$CD4T_EM_tripletORp_ratio = cell_count_Nicolas$CD4T_EM.tripletORp/cell_count_Nicolas_total
+cell_count_Nicolas$CD4TM_tripletORp_ratio = (cell_count_Nicolas$CD4T_EM.tripletORp + cell_count_Nicolas$CD4T_CM.tripletORp)/cell_count_Nicolas_total
+
+cell_count_Nicolas$CD4T_CM_tripletANDp_ratio = cell_count_Nicolas$CD4T_CM.tripletANDp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_tripletANDp_ratio = cell_count_Nicolas$CD8T_CM.tripletANDp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$TCM_tripletANDp_ratio = rowSums(cell_count_Nicolas[c("CD4T_CM.tripletANDp", "CD8T_CM.tripletANDp")])/rowSums(cell_count_Nicolas[c("CD4T_CM", "CD8T_CM")])
+
+cell_count_Nicolas$CD4T_CM_tripletORp_fake_ratio = cell_count_Nicolas$CD4T_CM_HLADRp_ratio + cell_count_Nicolas$CD4T_CM_KI67p_ratio + cell_count_Nicolas$CD4T_CM_CD38p_ratio
+cell_count_Nicolas$CD8T_CM_tripletORp_fake_ratio = cell_count_Nicolas$CD8T_CM_HLADRp_ratio + cell_count_Nicolas$CD8T_CM_KI67p_ratio + cell_count_Nicolas$CD8T_CM_CD38p_ratio
+cell_count_Nicolas$TCM_tripletORp_fake_ratio = cell_count_Nicolas$CD4T_CM_tripletORp_fake_ratio + cell_count_Nicolas$CD8T_CM_tripletORp_fake_ratio
+
+### meta data
+meta_data_df1 = read_excel(paste0(data_dir_Nicolas_discovery_FACS_1st, "_Discovery_cohort_FACS_First_round_Metadata.xlsx"))
+meta_data_df2 = read_excel(paste0(data_dir_Nicolas_discovery_FACS_2nd, "_Discovery_cohort_FACS_Second_round_Metadata.xlsx"))
+meta_data_df = rbind(meta_data_df1, meta_data_df2)
+
+cell_count_Nicolas = merge(meta_data_df, cell_count_Nicolas, by.y = "sample_id", by.x = "file_name")
+cell_count_Nicolas$Patient.ID_new = paste(cell_count_Nicolas$patient_id, cell_count_Nicolas$Sample_type, sep = "_")
+
+cell_count_Nicolas_df_baseline = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T1",]
+cell_count_Nicolas_df_ontreat = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T2",]
+cell_count_Nicolas_df_preIRAE = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T3",]
+cell_count_Nicolas_df_maxIRAE = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T4",]
+
+cell_count_Nicolas_df_baseline = cell_count_Nicolas_df_baseline[c("Patient.ID_new", flow_predictor_vec)]
+colnames(cell_count_Nicolas_df_baseline) = c("Patient.ID_new", paste0(flow_predictor_vec, "_T1"))
+cell_count_Nicolas_df_ontreat = cell_count_Nicolas_df_ontreat[c("Patient.ID_new", flow_predictor_vec)]
+colnames(cell_count_Nicolas_df_ontreat) = c("Patient.ID_new", paste0(flow_predictor_vec, "_T2"))
+cell_count_Nicolas_df_preIRAE = cell_count_Nicolas_df_preIRAE[c("Patient.ID_new", flow_predictor_vec)]
+colnames(cell_count_Nicolas_df_preIRAE) = c("Patient.ID_new", paste0(flow_predictor_vec, "_T3"))
+cell_count_Nicolas_df_maxIRAE = cell_count_Nicolas_df_maxIRAE[c("Patient.ID_new", flow_predictor_vec)]
+colnames(cell_count_Nicolas_df_maxIRAE) = c("Patient.ID_new", paste0(flow_predictor_vec, "_T4"))
+
+Nicolas_all_info = merge(Nicolas_all_info0, cell_count_Nicolas_df_baseline, by = "Patient.ID_new", all.x = T)
+Nicolas_all_info = merge(Nicolas_all_info, cell_count_Nicolas_df_ontreat, by = "Patient.ID_new", all.x = T)
+Nicolas_all_info = merge(Nicolas_all_info, cell_count_Nicolas_df_preIRAE, by = "Patient.ID_new", all.x = T)
+Nicolas_all_info = merge(Nicolas_all_info, cell_count_Nicolas_df_maxIRAE, by = "Patient.ID_new", all.x = T)
+
+```
+
+# (optional) Data preparation (Nunez 1 cohort, CyTOF) 
+```{r}
+
+flow_predictor = "CD8T_CM_tripletORp_ratio" 
+
+### annotated cell abundance
+cell_count_Nicolas1 <- read.csv(file = paste0(data_dir_Nicolas_discovery_CyTOF, "cell_counts_per_sample_batch1_T_subsets.csv"))
+cell_count_Nicolas2 <- read.csv(file = paste0(data_dir_Nicolas_discovery_CyTOF, "cell_counts_per_sample_batch2_T_subsets.csv"))
+# Combine the data frames
+cell_count_Nicolas <- bind_rows(cell_count_Nicolas1, cell_count_Nicolas2)
+cell_count_Nicolas[is.na(cell_count_Nicolas)] <- 0  # Replace all NAs with 0
+
+cell_count_Nicolas3 = read.csv(file = paste0(data_dir_Nicolas_discovery_CyTOF, "cell_counts_per_sample_batch1.csv"))
+cell_count_Nicolas4 = read.csv(file = paste0(data_dir_Nicolas_discovery_CyTOF, "cell_counts_per_sample_batch2.csv"))
+# Combine the data frames
+cell_total_Nicolas <- bind_rows(cell_count_Nicolas3, cell_count_Nicolas4)
+cell_total_Nicolas[is.na(cell_total_Nicolas)] <- 0  # Replace all NAs with 0
+cell_count_Nicolas_total = rowSums(cell_total_Nicolas[c(2:17,19)])
+
+
+cell_count_Nicolas$CD4T_CM_HLADRp_ratio = cell_count_Nicolas$CD4T_CM.HLADRp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_HLADRp_ratio = cell_count_Nicolas$CD8T_CM.HLADRp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$CD4T_CM_KI67p_ratio = cell_count_Nicolas$CD4T_CM.KI67p/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_KI67p_ratio = cell_count_Nicolas$CD8T_CM.KI67p/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$CD4T_CM_CD38p_ratio = cell_count_Nicolas$CD4T_CM.CD38p/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_CD38p_ratio = cell_count_Nicolas$CD8T_CM.CD38p/cell_count_Nicolas$CD8T_CM
+
+cell_count_Nicolas$CD4T_CM_tripletORp_ratio = cell_count_Nicolas$CD4T_CM.tripletORp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_tripletORp_ratio = cell_count_Nicolas$CD8T_CM.tripletORp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$TCM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_Nicolas$CD4T_CM + cell_count_Nicolas$CD8T_CM)
+cell_count_Nicolas$CD4T_EM_tripletORp_ratio = cell_count_Nicolas$CD4T_EM.tripletORp/cell_count_Nicolas$CD4T_EM
+cell_count_Nicolas$CD8T_EM_tripletORp_ratio = cell_count_Nicolas$CD8T_EM.tripletORp/cell_count_Nicolas$CD8T_EM
+cell_count_Nicolas$TEM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp")])/(cell_count_Nicolas$CD4T_EM + cell_count_Nicolas$CD8T_EM)
+cell_count_Nicolas$CD4TM_tripletORp_ratio = (cell_count_Nicolas$CD4T_EM.tripletORp + cell_count_Nicolas$CD4T_CM.tripletORp)/cell_count_Nicolas$CD4T_EM
+cell_count_Nicolas$CD8TM_tripletORp_ratio = (cell_count_Nicolas$CD8T_EM.tripletORp + cell_count_Nicolas$CD8T_CM.tripletORp)/cell_count_Nicolas$CD8T_EM
+cell_count_Nicolas$TM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp","CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_Nicolas$CD4T_EM + cell_count_Nicolas$CD8T_EM)
+
+cell_count_Nicolas$CD4T_CM_tripletANDp_ratio = cell_count_Nicolas$CD4T_CM.tripletANDp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_tripletANDp_ratio = cell_count_Nicolas$CD8T_CM.tripletANDp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$TCM_tripletANDp_ratio = rowSums(cell_count_Nicolas[c("CD4T_CM.tripletANDp", "CD8T_CM.tripletANDp")])/rowSums(cell_count_Nicolas[c("CD4T_CM", "CD8T_CM")])
+
+cell_count_Nicolas$CD4T_CM_tripletORp_fake_ratio = cell_count_Nicolas$CD4T_CM_HLADRp_ratio + cell_count_Nicolas$CD4T_CM_KI67p_ratio + cell_count_Nicolas$CD4T_CM_CD38p_ratio
+cell_count_Nicolas$CD8T_CM_tripletORp_fake_ratio = cell_count_Nicolas$CD8T_CM_HLADRp_ratio + cell_count_Nicolas$CD8T_CM_KI67p_ratio + cell_count_Nicolas$CD8T_CM_CD38p_ratio
+cell_count_Nicolas$TCM_tripletORp_fake_ratio = cell_count_Nicolas$CD4T_CM_tripletORp_fake_ratio + cell_count_Nicolas$CD8T_CM_tripletORp_fake_ratio
+
+### meta data
+meta_data_df = read_excel(paste0(data_dir, "freq_all_clinical_CYTOF.xlsx"))
+meta_data_df = meta_data_df[!is.na(meta_data_df$Patient_id),]
+meta_data_df$File_name_CyTOF = paste0("Discovery_cohort_CyTOF_Norm_", meta_data_df$File_name_CyTOF)
+
+cell_count_Nicolas = merge(meta_data_df, cell_count_Nicolas, by.y = "sample_id", by.x = "File_name_CyTOF")
+cell_count_Nicolas$Patient.ID_new = paste(cell_count_Nicolas$Patient_id, cell_count_Nicolas$Sample_type, sep = "_")
+
+cell_count_Nicolas_df_baseline = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T1",]
+cell_count_Nicolas_df_ontreat = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T2",]
+cell_count_Nicolas_df_preIRAE = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T3",]
+cell_count_Nicolas_df_maxIRAE = cell_count_Nicolas[cell_count_Nicolas$Timepoint=="T4",]
+
+cell_count_Nicolas_df_baseline = cell_count_Nicolas_df_baseline[c("Patient.ID_new", flow_predictor)]
+colnames(cell_count_Nicolas_df_baseline) = c("Patient.ID_new", paste0(flow_predictor, "_T1"))
+cell_count_Nicolas_df_ontreat = cell_count_Nicolas_df_ontreat[c("Patient.ID_new", flow_predictor)]
+colnames(cell_count_Nicolas_df_ontreat) = c("Patient.ID_new", paste0(flow_predictor, "_T2"))
+cell_count_Nicolas_df_preIRAE = cell_count_Nicolas_df_preIRAE[c("Patient.ID_new", flow_predictor)]
+colnames(cell_count_Nicolas_df_preIRAE) = c("Patient.ID_new", paste0(flow_predictor, "_T3"))
+cell_count_Nicolas_df_maxIRAE = cell_count_Nicolas_df_maxIRAE[c("Patient.ID_new", flow_predictor)]
+colnames(cell_count_Nicolas_df_maxIRAE) = c("Patient.ID_new", paste0(flow_predictor, "_T4"))
+
+Nicolas_all_info = merge(Nicolas_all_info0, cell_count_Nicolas_df_baseline, by = "Patient.ID_new", all.x = T)
+Nicolas_all_info = merge(Nicolas_all_info, cell_count_Nicolas_df_ontreat, by = "Patient.ID_new", all.x = T)
+Nicolas_all_info = merge(Nicolas_all_info, cell_count_Nicolas_df_preIRAE, by = "Patient.ID_new", all.x = T)
+Nicolas_all_info = merge(Nicolas_all_info, cell_count_Nicolas_df_maxIRAE, by = "Patient.ID_new", all.x = T)
+
+```
+
+# Data preparation of severe irAE annotation (Nunez 1 cohort, FACS) 
+```{r}
+
+irAE_info_df = read_excel("Nunez1_Patient_character.xlsx", sheet = "Patient charact (Discovery)")
+
+irAE_info_df = irAE_info_df[c("Patient ID", "Autoimmune toxicities (grade)")]
+irAE_info_df = irAE_info_df[!is.na(irAE_info_df$`Patient ID`), ]
+irAE_info_df$irAE_severe = NA
+irAE_info_df$irAE_severe[grepl("1|2|^-$", irAE_info_df$`Autoimmune toxicities (grade)`)] = 0
+irAE_info_df$irAE_severe[grepl("3|4", irAE_info_df$`Autoimmune toxicities (grade)`)] = 1
+
+irAE_info_df$`Autoimmune toxicities (grade)` = NULL
+
+Nicolas_all_info = merge(Nicolas_all_info, irAE_info_df, by.x = "Patient.ID", by.y = "Patient ID")
+
+```
+
+# Data preparation (Nunez 1 cohort, FACS)
+```{r}
+
+flow_tech = "FACS"  #  FACS CyTOF
+timePt = "T1" 
+flow_features = flow_predictor 
+flow_features = paste(flow_features, timePt, sep = "_")
+Olink_features = c("CXCL9", "CXCL10", "CXCL11", "IFNG", "IL17A", "IL10", "IL12A", "IL21")
+Olink_features = paste(Olink_features, timePt, sep = "_")
+phenotype <- "irAE_severe" 
+
+### Nicolas
+Nicolas_all_info$CD8T_EMRA_CD38p_ratio_FC <- Nicolas_all_info$CD8T_EMRA_CD38p_ratio_T2 / (Nicolas_all_info$CD8T_EMRA_CD38p_ratio_T1 + 0.000001)
+Nicolas_all_info$CD8T_KI67p_ratio_FC <- Nicolas_all_info$CD8T_KI67p_ratio_T2 / (Nicolas_all_info$CD8T_KI67p_ratio_T1 + 0.000001)
+Nicolas_all_info$CD4T_KI67p_ratio_FC <- Nicolas_all_info$CD4T_KI67p_ratio_T2 / (Nicolas_all_info$CD4T_KI67p_ratio_T1 + 0.000001)
+Nicolas_all_info$Treg_KI67p_ratio_FC <- Nicolas_all_info$Treg_KI67p_ratio_T2 / (Nicolas_all_info$Treg_KI67p_ratio_T1 + 0.000001)
+
+Nicolas_timePt_info = Nicolas_all_info[grepl(paste0("_",timePt, "|_FC$"), colnames(Nicolas_all_info), ignore.case = T)] 
+Nicolas_timePt_info = cbind(Nicolas_timePt_info, Nicolas_all_info[c("Cancer", phenotype)])
+Nicolas_timePt_info = Nicolas_timePt_info[Nicolas_timePt_info$Cancer == "Melanoma", ] 
+
+Olink_features %in% colnames(Nicolas_timePt_info)
+Olink_features_measured = Olink_features[Olink_features %in% colnames(Nicolas_timePt_info)]
+
+response <- Nicolas_timePt_info[[phenotype]]
+
+if (flow_tech == "FACS"){
+  #### compare AUCs of different biomarkers
+  all_single_predictors <- c(paste(flow_predictor_vec, timePt, sep = "_"), Olink_features)
+  all_single_predictors[2] <- "CD4T_EM_T1"
+  all_single_predictors[5] <- "CD8T_EMRA_CD38p_ratio_FC"
+  all_single_predictors[6] <- "CD8T_KI67p_ratio_FC"
+  all_single_predictors[7] <- "CD4T_KI67p_ratio_FC"
+  all_single_predictors[8] <- "Treg_KI67p_ratio_FC"
+  all_single_predictors[9] <- "Tregs_T1"
+  all_single_predictors[10] <- "CD4T_Naive_T1"
+  
+  all_single_predictors %in% colnames(Nicolas_timePt_info)
+  all_single_predictors = c(paste(flow_predictor_vec, timePt, sep = "_"), Olink_features)
+  AUC_vec = c()
+  AUC_low_vec = c()
+  AUC_up_vec = c()
+  for (sp in all_single_predictors){
+    if (sp %in% colnames(Nicolas_timePt_info)){
+      predictor <- Nicolas_timePt_info[[sp]]
+      df_temp = data.frame(p = predictor, r = response)
+      df_temp = na.omit(df_temp)
+      if (nrow(df_temp) == 0){
+        AUC_vec = c(AUC_vec, NA)
+        AUC_low_vec = c(AUC_low_vec, NA)
+        AUC_up_vec = c(AUC_up_vec, NA)
+      }else{
+        roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+        AUC_ci <- ci.auc(roc_obj)
+        AUC_vec = c(AUC_vec, AUC_ci[2])
+        AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+        AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+      }
+    }else{
+      AUC_vec = c(AUC_vec, NA)
+      AUC_low_vec = c(AUC_low_vec, NA)
+      AUC_up_vec = c(AUC_up_vec, NA)
+    }
+  }
+  AUC_result_df["Nicolas_FACS", ] = AUC_vec
+  AUC_lower_result_df["Nicolas_FACS", ] = AUC_low_vec
+  AUC_upper_result_df["Nicolas_FACS", ] = AUC_up_vec
+}
+
+predictor2 <- rowSums(Nicolas_timePt_info[flow_features]) 
+
+if (flow_tech == "CyTOF"){
+  Nicolas_CyTOF_predict_df = data.frame(phenotype = response, feature = predictor2)
+  Nicolas_FACS_predict_df = NULL
+}else{
+  Nicolas_FACS_predict_df = data.frame(phenotype = response, feature = predictor2)
+  Nicolas_CyTOF_predict_df = NULL
+}
+
+
+```
+
+
+# Data preparation (Nunez 2 cohort, CyTEK)
+```{r}
+
+### annotated cell abundance
+cell_count_Nicolas = read.csv(file = paste0(data_dir_Nicolas_validation, "cell_counts_per_sample_T_subsets.csv")) 
+
+cell_count_Nicolas_df2 = read.csv(file = paste0(data_dir_Nicolas_validation, "cell_counts_per_sample.csv"))
+cell_count_Nicolas_total = rowSums(cell_count_Nicolas_df2[c(2:11,13)])
+cell_count_Nicolas_total_CD4T = rowSums(cell_count_Nicolas_df2[c(2:5)])
+cell_count_Nicolas_total_CD8T = rowSums(cell_count_Nicolas_df2[c(6:9)])
+cell_count_Nicolas_total_T = cell_count_Nicolas_total
+
+cell_count_Nicolas$CD4T_CM_HLADRp_ratio = cell_count_Nicolas$CD4T_CM.HLADRp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_HLADRp_ratio = cell_count_Nicolas$CD8T_CM.HLADRp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$CD4T_CM_KI67p_ratio = cell_count_Nicolas$CD4T_CM.KI67p/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_KI67p_ratio = cell_count_Nicolas$CD8T_CM.KI67p/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$CD4T_CM_CD38p_ratio = cell_count_Nicolas$CD4T_CM.CD38p/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_CD38p_ratio = cell_count_Nicolas$CD8T_CM.CD38p/cell_count_Nicolas$CD8T_CM
+
+cell_count_Nicolas$CD8T_KI67p_ratio = rowSums(cell_count_Nicolas[c("CD8T_Naive.KI67p", "CD8T_CM.KI67p", "CD8T_EM.KI67p", "CD8T_EMRA.KI67p")])/cell_count_Nicolas_total_T
+cell_count_Nicolas$CD4T_KI67p_ratio = rowSums(cell_count_Nicolas[c("CD4T_Naive.KI67p", "CD4T_CM.KI67p", "CD4T_EM.KI67p", "CD4T_EMRA.KI67p")])/cell_count_Nicolas_total_T
+cell_count_Nicolas$Treg_KI67p_ratio = cell_count_Nicolas$Tregs.KI67p/cell_count_Nicolas_total_T
+cell_count_Nicolas$CD8T_EMRA_CD38p_ratio = cell_count_Nicolas$CD8T_EMRA.CD38p/cell_count_Nicolas_total_CD8T
+
+cell_count_Nicolas$CD4T_CM_tripletORp_ratio = cell_count_Nicolas$CD4T_CM.tripletORp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_tripletORp_ratio = cell_count_Nicolas$CD8T_CM.tripletORp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$TCM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_Nicolas$CD4T_CM + cell_count_Nicolas$CD8T_CM)
+cell_count_Nicolas$CD8T_EM_tripletORp_ratio = cell_count_Nicolas$CD8T_EM.tripletORp/cell_count_Nicolas$CD8T_EM
+cell_count_Nicolas$TEM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp")])/(cell_count_Nicolas$CD4T_EM + cell_count_Nicolas$CD8T_EM)
+cell_count_Nicolas$CD8TM_tripletORp_ratio = (cell_count_Nicolas$CD8T_EM.tripletORp + cell_count_Nicolas$CD8T_CM.tripletORp)/cell_count_Nicolas$CD8T_EM
+cell_count_Nicolas$TM_tripletORp_ratio = rowSums(cell_count_Nicolas[c("CD4T_EM.tripletORp", "CD8T_EM.tripletORp","CD4T_CM.tripletORp", "CD8T_CM.tripletORp")])/(cell_count_Nicolas$CD4T_EM + cell_count_Nicolas$CD8T_EM)
+cell_count_Nicolas$CD4T_EM_tripletORp_ratio = cell_count_Nicolas$CD4T_EM.tripletORp/cell_count_Nicolas_total
+cell_count_Nicolas$CD4TM_tripletORp_ratio = (cell_count_Nicolas$CD4T_EM.tripletORp + cell_count_Nicolas$CD4T_CM.tripletORp)/cell_count_Nicolas_total
+
+cell_count_Nicolas$CD4T_CM_tripletANDp_ratio = cell_count_Nicolas$CD4T_CM.tripletANDp/cell_count_Nicolas$CD4T_CM
+cell_count_Nicolas$CD8T_CM_tripletANDp_ratio = cell_count_Nicolas$CD8T_CM.tripletANDp/cell_count_Nicolas$CD8T_CM
+cell_count_Nicolas$TCM_tripletANDp_ratio = rowSums(cell_count_Nicolas[c("CD4T_CM.tripletANDp", "CD8T_CM.tripletANDp")])/rowSums(cell_count_Nicolas[c("CD4T_CM", "CD8T_CM")])
+
+cell_count_Nicolas$CD4T_CM_tripletORp_fake_ratio = cell_count_Nicolas$CD4T_CM_HLADRp_ratio + cell_count_Nicolas$CD4T_CM_KI67p_ratio + cell_count_Nicolas$CD4T_CM_CD38p_ratio
+cell_count_Nicolas$CD8T_CM_tripletORp_fake_ratio = cell_count_Nicolas$CD8T_CM_HLADRp_ratio + cell_count_Nicolas$CD8T_CM_KI67p_ratio + cell_count_Nicolas$CD8T_CM_CD38p_ratio
+cell_count_Nicolas$TCM_tripletORp_fake_ratio = cell_count_Nicolas$CD4T_CM_tripletORp_fake_ratio + cell_count_Nicolas$CD8T_CM_tripletORp_fake_ratio
+
+
+### meta data
+metadata_filename = paste0(data_dir_Nicolas_validation, "_Validation_Cohort_Cytek_Metadata.xlsx") 
+md_df <- read_excel(metadata_filename)
+allInfo_Nicolas = merge(cell_count_Nicolas, md_df, by.x = "sample_id", by.y = "file_name")
+
+### clinical data
+clinicaldata_filename = paste0("/Users/changt7/Documents/00.PostDocWork/CancerResearch/01.Projects/00.Collaborating_projects/10.UUtahPIVOTCenter_Siwen/02.Input/LukasFlatz_2023_Med/", "Patient_character.xlsx") 
+md_df <- read_excel(clinicaldata_filename, sheet = "Patient charact (Validation)")
+md_df = md_df[c("Patient ID", "Cancer", "Gender", "Age", "Group")]
+md_df$Patient_ID = toupper(md_df$`Patient ID`)
+md_df$irAE = ifelse(grepl("no TOX", md_df$Group), 0, 1)
+md_df$ICBR = ifelse(grepl("NR", md_df$Group), 0, 1)
+
+
+###### T1 OLINK data, only for some patients
+olink_raw_df <- olink_raw_df[olink_raw_df$Timepoint == 1, c("Patient_ID", "CXCL9", "CXCL10", "CXCL11", "IFNgamma")]
+colnames(olink_raw_df) <- c("Patient_ID", "CXCL9", "CXCL10","CXCL11","IFNG")
+olink_raw_df[c("CXCL9", "CXCL10","CXCL11","IFNG")] <- 2^(olink_raw_df[c("CXCL9", "CXCL10","CXCL11","IFNG")])
+
+md_Olink_df = merge(md_df, olink_raw_df, by = "Patient_ID", all.x = T)
+
+allInfo_Nicolas_T1 = allInfo_Nicolas[allInfo_Nicolas$Timepoint=="T1", c(2:147, 149)]
+allInfo_Nicolas_T2 = allInfo_Nicolas[allInfo_Nicolas$Timepoint=="T2", c(2:147, 149)]
+colnames(allInfo_Nicolas_T1)[1:146] = paste0(colnames(allInfo_Nicolas_T1)[1:146], "_T1")
+colnames(allInfo_Nicolas_T2)[1:146] = paste0(colnames(allInfo_Nicolas_T2)[1:146], "_T2")
+
+allInfo_Nicolas = merge(md_Olink_df, allInfo_Nicolas_T1, by.x = "Patient_ID", by.y = "Patient_Id", all.x = T)
+allInfo_Nicolas = merge(allInfo_Nicolas, allInfo_Nicolas_T2, by.x = "Patient_ID", by.y = "Patient_Id", all.x = T)
+
+
+```
+
+# Data preparation of severe irAE annotation (Nunez 2 cohort, CyTEK)
+```{r}
+
+irAE_info_df = read_excel("Nunez2_Patient_character.xlsx", sheet = "Patient charact (Validation)")
+
+irAE_info_df = irAE_info_df[c("Patient ID", "Autoimmune toxicities (grade)")]
+irAE_info_df$irAE_severe = NA
+irAE_info_df$irAE_severe[grepl("1|2|^-$", irAE_info_df$`Autoimmune toxicities (grade)`)] = 0
+irAE_info_df$irAE_severe[grepl("3|4", irAE_info_df$`Autoimmune toxicities (grade)`)] = 1
+
+irAE_info_df$`Autoimmune toxicities (grade)` = NULL
+allInfo_Nicolas = merge(allInfo_Nicolas, irAE_info_df, by = "Patient ID")
+
+```
+
+
+# Data preparation (Nunez 2 cohort, CyTEK)
+```{r}
+
+flow_features = flow_predictor 
+timePt = "T1" 
+phenotype = "irAE_severe" 
+
+flow_features = paste(flow_features, timePt, sep = "_")
+Olink_features = c("CXCL9", "CXCL10", "CXCL11", "IFNG", "IL17A_OLINK", "IL10_OLINK", "IL12A_OLINK", "IL21_OLINK") # 
+
+allInfo_Nicolas$CD8T_EMRA_CD38p_ratio_FC <- allInfo_Nicolas$CD8T_EMRA_CD38p_ratio_T2 / (allInfo_Nicolas$CD8T_EMRA_CD38p_ratio_T1 + 0.000001)
+allInfo_Nicolas$CD8T_KI67p_ratio_FC <- allInfo_Nicolas$CD8T_KI67p_ratio_T2 / (allInfo_Nicolas$CD8T_KI67p_ratio_T1 + 0.000001)
+allInfo_Nicolas$CD4T_KI67p_ratio_FC <- allInfo_Nicolas$CD4T_KI67p_ratio_T2 / (allInfo_Nicolas$CD4T_KI67p_ratio_T1 + 0.000001)
+allInfo_Nicolas$Treg_KI67p_ratio_FC <- allInfo_Nicolas$Treg_KI67p_ratio_T2 / (allInfo_Nicolas$Treg_KI67p_ratio_T1 + 0.000001)
+
+Nicolas_timePt_info = allInfo_Nicolas[grepl(paste0("_",timePt, "|_FC$"), colnames(allInfo_Nicolas), ignore.case = T)] # 1001+1472 = 2473 features
+
+Nicolas_timePt_info = allInfo_Nicolas[allInfo_Nicolas$Cancer == "Melanoma", ] # NSCLC Melanoma
+
+Olink_features %in% colnames(Nicolas_timePt_info)
+Olink_features_measured = Olink_features[Olink_features %in% colnames(Nicolas_timePt_info)]
+
+response <- Nicolas_timePt_info[[phenotype]]
+
+#### compare AUCs of different biomarkers
+all_single_predictors <- c(paste(flow_predictor_vec, timePt, sep = "_"), Olink_features)
+all_single_predictors[2] <- "CD4T_EM_T1"
+all_single_predictors[5] <- "CD8T_EMRA_CD38p_ratio_FC"
+all_single_predictors[6] <- "CD8T_KI67p_ratio_FC"
+all_single_predictors[7] <- "CD4T_KI67p_ratio_FC"
+all_single_predictors[8] <- "Treg_KI67p_ratio_FC"
+all_single_predictors[9] <- "Tregs_T1"
+all_single_predictors[10] <- "CD4T_Naive_T1"
+
+all_single_predictors %in% colnames(Nicolas_timePt_info)
+
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(Nicolas_timePt_info)){
+    predictor <- Nicolas_timePt_info[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC_ci <- ci.auc(roc_obj)
+    AUC_vec = c(AUC_vec, AUC_ci[2])
+    AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+    AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+    AUC_low_vec = c(AUC_low_vec, NA)
+    AUC_up_vec = c(AUC_up_vec, NA)
+  }
+}
+AUC_result_df["Nicolas_CyTEK", ] = AUC_vec
+AUC_lower_result_df["Nicolas_CyTEK", ] = AUC_low_vec
+AUC_upper_result_df["Nicolas_CyTEK", ] = AUC_up_vec
+
+predictor2 <- rowSums(Nicolas_timePt_info[flow_features]) 
+
+Nicolas_CyTEK_predict_df = data.frame(phenotype = response, feature = predictor2)
+
+```
+
+# Figure 3A-D/SFigure 4H. Plot ROC, AUC, scatter boxplot (non-severe irAE vs severe irAE), barplot with odds ratio (across 4 datasets)
+```{r}
+
+dataset = "HCI002" # HCI002 HCI001 Nicolas_CyTOF Nicolas_FACS Nicolas_CyTEK
+plot_data = HCI002_predict_df #  HCI002_predict_df HCI001_predict_df Nicolas_FACS_predict_df Nicolas_CyTEK_predict_df
+
+cutoff = 0.04 # 0.04, based on median value on HCI002
+phenotype_lower = "severe irAE" 
+phenotype_Upper = "Severe irAE" 
+
+plot_data = na.omit(plot_data)
+print(paste("Sample number: ", nrow(plot_data)))
+
+# Map phenotype labels
+plot_data$phenotype2 <- factor(plot_data$phenotype, levels = c(0, 1),
+                              labels = c(paste0("No ", phenotype_lower), phenotype_Upper))
+plot_data$group <- ifelse(plot_data$feature <= cutoff, "Low", "High")
+plot_data$group = factor(plot_data$group, levels = c("Low", "High"))
+
+################## ROC and AUC plot ##################
+# Calculate the ROC curve
+roc_obj <- roc(plot_data$phenotype, plot_data$feature)
+# Calculate the AUC with the 95% CI
+AUC_ci <- ci.auc(roc_obj)
+AUC = AUC_ci[2]
+AUC_low = AUC_ci[1]
+AUC_up = AUC_ci[3]
+# Calculate the p-value for the AUC
+p_val = roc.area(plot_data$phenotype, plot_data$feature)$p.value
+label <- sprintf("AUC = %.2f (%.2f,%.2f)", AUC,AUC_low,AUC_up)
+
+pdf_file <- paste0(result_figure_dir,paste0("ROC_",dataset,".pdf"))
+fig_width = 2.7
+fig_height = 2.2
+fontSize = 1.2
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot() +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "1 - Specificity", y = "Sensitivity") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  geom_line(data = data.frame(specificity=roc_obj$sensitivities, sensitivity=roc_obj$specificities), aes(x = 1 - specificity, y = sensitivity), color = "black", linetype = "solid", linewidth = 1) +
+  annotate(
+    geom = "text",
+    x = 0.17,
+    y = 0.1,
+    hjust = 0,
+    label = label,
+    size = 4
+  ) +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color="black"),
+        axis.line.x = element_line(color="black"),
+        axis.ticks.y = element_line(color="black"),
+        axis.ticks.x = element_line(color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color="black"),
+        panel.border = element_blank(), # remove top and right border lines
+        )
+dev.off()
+
+
+
+################## box and scatter plot ##################
+# Calculate Wilcoxon p-value
+wilcox_p <- wilcox.test(feature ~ phenotype2, data = plot_data, alternative = "two.sided")$p.value
+formatted_p <- paste0("P = ", signif(wilcox_p, digits = 2))
+
+# Plot
+pdf_file <- paste0(result_figure_dir,paste0("boxplot_",dataset,".pdf"))
+fig_width = 1.5
+fig_height = 3.3
+fontSize = 1.2
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+
+ggplot(plot_data, aes(x = phenotype2, y = feature * 100, fill = phenotype2)) +
+  geom_jitter(aes(color = phenotype2), width = 0.2, size = 2) +      # Scatter points
+  scale_color_manual(values = c("blue", "brown")) +                # Scatter point colors
+  geom_boxplot(outlier.shape = NA, alpha = 0.5, color = "black") +  # Boxplot
+  scale_fill_manual(values = c("blue", "brown")) +                  # Boxplot fill colors
+  labs(x = NULL, y = "% activated CD8+ TCM / CD8+ TCM", title = "") +
+  ylim(0,90)+
+  theme(panel.grid = element_blank(), 
+      panel.background = element_rect(fill = "white"),
+      axis.line.y = element_line(color="black"),
+      axis.line.x = element_line(color="black"),
+      axis.ticks.y = element_line(color="black"),
+      axis.ticks.x = element_line(color="black"),
+      axis.text.y = element_text(color="black"),
+      axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+      legend.position = "none",
+      panel.border = element_blank(), # remove top and right border lines
+      ) +
+geom_signif(comparisons = list(c(paste0("No ", phenotype_lower), phenotype_Upper)), 
+              annotations = formatted_p, 
+              textsize = 4,
+              #y_position = max(plot_data$feature) * 100 + 5, 
+              y_position = 80, 
+              vjust = -0.5,  # Adjust the vertical position of the text relative to the bracket
+              tip_length = 0.05) 
+dev.off()
+
+
+################## barplot ##################
+# Calculate the irAE rates for the two groups
+irAE_rates <- aggregate(phenotype ~ group, data = plot_data, FUN = function(x) mean(as.numeric(x) == 1) * 100)
+
+# Perform chi-square test
+table_data <- table(plot_data$group, plot_data$phenotype2)
+ks_p <- chisq.test(table_data)$p.value
+#formatted_p <- paste0("P = ", signif(ks_p, digits = 2))
+formatted_p <- paste0("OR = ", round(irAE_rates$phenotype[2]/irAE_rates$phenotype[1],1))
+
+# Create the plot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_",dataset,".pdf"))
+fig_width <- 1.5
+fig_height <- 3
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+
+ggplot(irAE_rates, aes(x = group, y = phenotype, fill = group)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +  # Barplot
+  labs(x = NULL, y = paste0(phenotype_Upper, " (%)"), title = "") +
+  ylim(0, 100) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(color = "black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  ) +
+  geom_signif(
+    comparisons = list(c("Low", "High")),
+    annotations = formatted_p,
+    textsize = 4,
+    y_position = 90,  # Position of the p-value annotation
+    vjust = -0.5,  # Adjust the vertical position of the text relative to the bracket
+    tip_length = 0.05
+  )
+
+dev.off()
+
+print(paste("Odds ratio: ", irAE_rates$phenotype[2]/irAE_rates$phenotype[1]))
+
+```
+
+# Figure 3E. Plot AUC comparison of different cellular predictors (across 4 datasets)
+```{r}
+
+AUC_result_df$IL12A = NULL
+AUC_result_df$IL21 = NULL
+AUC_result_df$IFNG = NULL
+AUC_result_df$IL10 = NULL
+AUC_result_df$IL17A = NULL
+AUC_result_df$CXCL9 = NULL
+AUC_result_df$CXCL10 = NULL
+AUC_result_df$CXCL11 = NULL
+AUC_result_df$Tregs = NULL
+
+### Calculate mean values for each column, omitting NAs
+mean_values <- colMeans(AUC_result_df, na.rm = TRUE)
+AUC_result_df["Mean", ] <- mean_values
+
+ordered_cols <- order(-as.numeric(AUC_result_df["Mean", ]))
+AUC_result_df <- AUC_result_df[, ordered_cols]
+
+plot_vars = colnames(AUC_result_df)
+AUC_result_df2 = AUC_result_df[1:4,]
+AUC_result_df2 = AUC_result_df2[colnames(AUC_result_df2) %in% plot_vars]
+
+# Reshape the data to a long format
+AUC_result_df2$Dataset <- rownames(AUC_result_df2)
+AUC_result_df_long <- melt(AUC_result_df2, id.vars = "Dataset", variable.name = "GeneSignature", value.name = "AUC")
+
+# clean the labels
+AUC_result_df_long$Dataset[AUC_result_df_long$Dataset == "Nicolas_FACS"] <- "Nunez 1 (FACS)"
+AUC_result_df_long$Dataset[AUC_result_df_long$Dataset == "Nicolas_CyTEK"] <- "Nunez 2 (CyTEK)"
+AUC_result_df_long$Dataset = factor(AUC_result_df_long$Dataset, levels = c("HCI001","HCI002","Nunez 1 (FACS)","Nunez 2 (CyTEK)"))
+
+AUC_result_df_long$GeneSignature <- as.character(AUC_result_df_long$GeneSignature)
+# Create a named vector for mapping old names to new names
+rename_map <- c(
+  "CD8T_CM_tripletORp_ratio"   = "Activated CD8Tcm",
+  "CD8T_KI67p_ratio"           = "Ki67+ CD8T",
+  "CD4T_Naive"                 = "Naive CD4T",
+  "CD4T_KI67p_ratio"           = "Ki67+ CD4T",
+  "Treg_KI67p_ratio"           = "Ki67+ Treg",
+  "CD4TM_tripletORp_ratio"     = "Activated CD4Tm",
+  "CD8T_EMRA_CD38p_ratio"      = "CD38+ CD8Temra",
+  "CD4T_EM_tripletORp_ratio"   = "Activated CD4Tem",
+  "CD4T_EM"                    = "CD4Tem"
+)
+# Apply the mapping to the GeneSignature column
+AUC_result_df_long$GeneSignature <- rename_map[AUC_result_df_long$GeneSignature]
+
+# Calculate the mean AUC for each gene signature
+gene_signature_means <- aggregate(AUC ~ GeneSignature, data = AUC_result_df_long, FUN = mean)
+
+# Order the gene signatures by mean AUC from high to low
+ordered_gene_signatures <- as.character(gene_signature_means$GeneSignature[order(gene_signature_means$AUC, decreasing = TRUE)])
+
+# Create a boxplot with different colors for each dataset
+pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_AllDatasets.pdf")) 
+fig_width = 4.5*1.2
+fig_height = 3.3*1.2
+dot_size <- 2
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(AUC_result_df_long, aes(x = GeneSignature, y = AUC)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", fill = "white", color = "black") +  
+  geom_jitter(aes(color = Dataset), position = position_jitter(0.2), size = dot_size) +  
+  scale_x_discrete(limits = ordered_gene_signatures) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+  labs(title = "", x = "", y = "AUC") +
+  ylim(0, 1) +
+  scale_color_manual(values = my.cols, name = "") +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.ticks.y = element_line(color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black", angle = 50, hjust = 1),
+        legend.spacing.y = unit(0.1, "cm"),  # reduce vertical space
+        legend.box.spacing = unit(0.1, "cm"), # optional: spacing between legend and plot
+        panel.border = element_blank(), legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(size = dot_size), nrow = 4))  
+dev.off()
+
+```
+
+# Figure 3I/SFigure 4D-E,G. K-M survival curves to test whether the signatures could predict time-to-severe irAE, OS, PFS (HCI002)
+```{r}
+
+feature_test <- "CD8T_CM_tripletORp_ratio_baseline"  # CD8T_CM_tripletORp_ratio_baseline CD4_TEM_FC_baselineL2 
+exp_cutoff_method <- "abs" 
+
+therapy_type_vec <- c("Active", "All", "Adjuvant", "Neoadjuvant") # All active (n=82) adjuvant (n=66)  neoadjuvant (n=11)
+phenotype_str_vec <- c("OS", "PFS", "Nonsevere_irAE") # Nonsevere_irAE OS PFS
+
+for(therapy_type in therapy_type_vec){
+  for (phenotype_str in phenotype_str_vec){
+    if (phenotype_str == "OS"){
+      y_label_str <- "Overall \nsurvival probability" # Severe-irAE-free \nsurvival probability; Overall OS probability; Progression-free PFS probability; 
+    }else if (phenotype_str == "PFS"){
+      y_label_str <- "Progression-free \nsurvival probability"
+    }else if (phenotype_str == "Nonsevere_irAE"){
+      y_label_str <- "Severe-irAE-free \nsurvival probability"
+    }
+    
+    ### separate with TherapyType
+    if (therapy_type == "All"){
+      predictor_df <- HCI002_all_info[c("Vial ID", "patient_therapy", feature_test)]
+    }else{
+      predictor_df <- HCI002_all_info[HCI002_all_info$TherapyType == therapy_type, c("Vial ID", "patient_therapy", feature_test)] 
+    }
+    
+    predictor_df <- na.omit(predictor_df)
+    predictor_df$uniqueID <- paste0(predictor_df$patient_therapy, "_", predictor_df$`Vial ID`)
+    predictor_df <- predictor_df[!duplicated(predictor_df$uniqueID), ]
+
+    ## load survival information
+    survival_info_df <- read_excel("HCI002 Teiko clinical info 7.12.23_clean_newest.xlsx")
+    survival_info_df <- survival_info_df[c("Vial ID", "Record ID", "Systemic Therapy Name", "Systemic Therapy Type", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event")]
+    survival_info_df$uniqueID <- paste0(survival_info_df$`Record ID`, "_", survival_info_df$`Systemic Therapy Name`, "_", survival_info_df$`Systemic Therapy Type`, "_", survival_info_df$`Vial ID`)
+    
+    survival_all_info_HCI002 <- merge(predictor_df, survival_info_df, by = "uniqueID", x.all = T)
+    survival_all_info_HCI002 <- survival_all_info_HCI002[!is.na(survival_all_info_HCI002[[feature_test]]), ]
+    
+    ## convert days to months
+    survival_all_info_HCI002$OS_time <- survival_all_info_HCI002$OS_time / 30
+    survival_all_info_HCI002$PFS_time <- survival_all_info_HCI002$PFS_time / 30
+    survival_all_info_HCI002$Nonsevere_irAE_time <- survival_all_info_HCI002$Nonsevere_irAE_time / 30
+    
+    ############# Survival test for OS / PFS / time-irAEmax
+    Score_Pred = survival_all_info_HCI002[[feature_test]]
+    Score=Score_Pred
+    if (exp_cutoff_method == "quantile"){
+      exp_cutoff = quantile(Score_Pred, 0.5)
+    }else if (exp_cutoff_method == "abs"){
+      exp_cutoff = 0.04
+    }
+    
+    Score[Score_Pred>exp_cutoff]="High"
+    Score[Score_Pred<=exp_cutoff]="Low"
+    Score <- factor(Score)
+    Score <- relevel(Score, ref = "Low")
+    cancerData=data.frame(Score,survival_all_info_HCI002[[paste0(phenotype_str, "_time")]],survival_all_info_HCI002[[paste0(phenotype_str, "_event")]])
+    colnames(cancerData) = c("Score","OS_time","OS_event")
+    
+    sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+    scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+    scox_coef = summary(scox)$coefficients
+    HR_value = scox_coef[2] # hazard ratio
+    Z_value=scox_coef[4]
+    P_value=scox_coef[5]
+    HR_CI = summary(scox)$conf.int[3:4]
+    
+    ##### plot
+    fontSize = 12
+    survp=ggsurvplot(
+      sfit,
+      data = cancerData,
+      size = 1,                 # change line size
+      palette =
+        c("#00305d", "#9c1915"),# custom color palettes
+      conf.int = FALSE,          # Add confidence interval
+      pval = FALSE,              # Add p-value
+      #pval.coord = c(70*0.65, 0.55),
+      xlim = c(-3,70),
+      ylim=c(0,1),
+      xlab = "Time (months)", ylab= y_label_str,# 
+      break.time.by = 10,
+      risk.table=TRUE,
+      risk.table.height = 0.25, # Useful to change when you have multiple groups
+      risk.table.pos="out",
+      risk.table.col="black",
+      risk.table.y.text = FALSE,
+      tables.y.text = FALSE, 
+      tables.theme = theme_cleantable(),
+      legend.labs =c("Low", "High"),    # Change legend labels
+      legend.title="",
+      legend = c(0.75, 0.975), # legend relative position
+      font.main = c(fontSize),
+      font.caption = c(fontSize),
+      font.legend = c(fontSize),
+      font.tickslab = c(fontSize),
+      font.x = c(fontSize),
+      font.y = c(fontSize),
+      ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                     plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                     panel.background = element_rect(fill = "white"),
+                     panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                     panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                     axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+    ) # + guides(colour = guide_legend(nrow = 1)) # legend in rows
+    
+    survp$plot = survp$plot+ 
+                ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+    pdf(paste0(result_figure_dir, "KM_curve_",therapy_type,"_",phenotype_str,"_",feature_test,"_HCI002.pdf"),width=3.3, height=3)
+    print(survp, newpage = FALSE)
+    dev.off()
+  }
+}
+
+```
+
+# Multi-variate Cox regression (Sex, age, stage, ICB experience, the presence of severe irAEs etc) in HCI002 (Data preparation) 
+```{r}
+
+feature_test <- "CD8T_CM_tripletORp_ratio_baseline"  
+phenotype_str <- "Nonsevere_irAE" # Nonsevere_irAE OS PFS
+y_label_str <- "Severe-irAE-free \nsurvival probability" # Severe-irAE-free \nsurvival probability; Overall survival OS probability; Progression-free survival PFS probability; 
+
+# get the predictor from the HCI002_all_info
+predictor_df <- HCI002_all_info[c("Vial ID", "patient_therapy", feature_test, "Gender", "Age at C1", "ICI Naïve?", "Systemic Therapy Type", "Baseline Stage / TNM", "Last Cycle Number", "Duration of treatment", "IRAEactionable01", "Systemic Therapy Name")]
+predictor_df$Sex <- ifelse(predictor_df$Gender == "Male",1,0)
+predictor_df$Sex <- factor(predictor_df$Sex, levels = c(0,1))
+predictor_df$Age <- predictor_df$`Age at C1`
+predictor_df$previousICB <- ifelse(predictor_df$`ICI Naïve?` == "Yes",0,1)
+predictor_df$previousICB <- factor(predictor_df$previousICB, levels = c(0,1))
+predictor_df$activeICB <- ifelse(predictor_df$`Systemic Therapy Type` == "active treatment",1,0)
+predictor_df$activeICB <- factor(predictor_df$activeICB, levels = c(0,1))
+predictor_df$Stage <- ifelse(grepl("Stage IV", predictor_df$`Baseline Stage / TNM`),1,0)
+predictor_df$Stage <- factor(predictor_df$Stage, levels = c(0,1))
+predictor_df$ICBcycles <- predictor_df$`Last Cycle Number` # no need, redundant to ICBduration
+predictor_df$ICBduration <- predictor_df$`Duration of treatment`
+predictor_df$Drug = "PD1/PDL1"
+predictor_df$Drug[predictor_df$`Systemic Therapy Name` %in% c("Nivolumab/ Ipilimumab", "PD1-CTLA4 bispecific", "Ipi 10 / temozolomide", "Nivolumab/ Ipilimumab flipped dose", "Ipi 3 / temozolomide", "Pembrolizumab / CTLA-4-LAG3 bispecific", "CTLA-4-LAG3 bispecific", "Pembrolizumab/ anti-CTLA4", "anti-CTLA4")] = "CTLA4-containing"
+
+predictor_df <- predictor_df[c("Vial ID", "patient_therapy", feature_test, "Sex", "Age", "previousICB", "activeICB", "Stage", "ICBduration", "IRAEactionable01", "Drug", "ICBcycles")]
+
+predictor_df <- na.omit(predictor_df)
+predictor_df$uniqueID <- paste0(predictor_df$patient_therapy, "_", predictor_df$`Vial ID`)
+predictor_df <- predictor_df[!duplicated(predictor_df$uniqueID), ]
+
+## load survival information
+survival_info_df <- read_excel("/Users/changt7/Documents/00.PostDocWork/CancerResearch/01.Projects/00.Collaborating_projects/10.UUtahPIVOTCenter_Siwen/02.Input/Siwen_mainCohort/HCI002/HCI002 Teiko clinical info 7.12.23_clean_newest.xlsx")
+survival_info_df <- survival_info_df[c("Vial ID", "Record ID", "Systemic Therapy Name", "Systemic Therapy Type", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event")]
+survival_info_df$uniqueID <- paste0(survival_info_df$`Record ID`, "_", survival_info_df$`Systemic Therapy Name`, "_", survival_info_df$`Systemic Therapy Type`, "_", survival_info_df$`Vial ID`)
+
+survival_all_info_HCI002 <- merge(predictor_df, survival_info_df, by = "uniqueID", x.all = T)
+
+survival_all_info_HCI002 <- survival_all_info_HCI002[!is.na(survival_all_info_HCI002[[feature_test]]), ]
+
+## convert days to months
+survival_all_info_HCI002$OS_time <- survival_all_info_HCI002$OS_time / 30
+survival_all_info_HCI002$PFS_time <- survival_all_info_HCI002$PFS_time / 30
+survival_all_info_HCI002$Nonsevere_irAE_time <- survival_all_info_HCI002$Nonsevere_irAE_time / 30
+
+```
+
+# Figure 3J. Multi-variate Cox regression OS/PFS Forest plot (HCI002)
+```{r}
+
+Outcome_all = c("OS_time", "OS_event", "PFS_time", "PFS_event")
+test_var <- 'CD8T_CM_tripletORp_ratio_baseline'
+test_var_show <- "Activated CD8Tcm"
+control_vars <- c("Age", "Sex", "Stage", "Drug", "previousICB", "IRAEactionable01") 
+control_vars_show <- c("Age", "Sex (Female vs male)", "Stage (IV vs I-III)", "Drug (anti-PD(L)1 vs\n anti-CTLA4-containing)", "Previous ICB therapy", "Severe irAE")
+columns_keep = c(test_var, control_vars, Outcome_all)
+
+all_info <- survival_all_info_HCI002[columns_keep]
+
+colnames(all_info) <- c(test_var, control_vars, "OS_time", "OS_event", "PFS_time", "PFS_event")
+
+result_df = data.frame(Variable = character(),
+                       HR_OS = numeric(),
+                       HR_OS_low = numeric(),
+                       HR_OS_up = numeric(),
+                       p_val_OS = numeric(),
+                       HR_PFS = numeric(),
+                       HR_PFS_low = numeric(),
+                       HR_PFS_up = numeric(),
+                       p_val_PFS = numeric())
+result_df[length(control_vars)+1,]=NA
+cancerData_all = all_info
+
+cn = test_var
+Score_Pred = cancerData_all[[cn]]
+Score=Score_Pred
+exp_cutoff = 0.04
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+##### OS
+cancerData=data.frame(Score,cancerData_all[c(control_vars,"OS_time","OS_event")])
+colnames(cancerData) = c("Score",control_vars,"OS_time","OS_event")
+cancerData = na.omit(cancerData)
+# Combine Score and control variables into a formula string
+formula_str <- paste("Surv(OS_time, OS_event) ~ Score +", paste(control_vars, collapse = " + "))
+# Convert to formula
+sfit_formula <- as.formula(formula_str)
+# Fit the model
+sfit <- survfit(sfit_formula, data = cancerData)
+# Fit Cox proportional hazards model
+scox_OS <- coxph(sfit_formula, data = cancerData)
+scox_coef_OS = summary(scox_OS)$coefficients
+
+
+##### PFS
+cancerData=data.frame(Score,cancerData_all[c(control_vars,"PFS_time","PFS_event")])
+colnames(cancerData) = c("Score",control_vars,"PFS_time","PFS_event")
+cancerData = na.omit(cancerData)
+# Combine Score and control variables into a formula string
+formula_str <- paste("Surv(PFS_time, PFS_event) ~ Score +", paste(control_vars, collapse = " + "))
+# Convert to formula
+sfit_formula <- as.formula(formula_str)
+# Fit the model
+sfit <- survfit(sfit_formula, data = cancerData)
+# Fit Cox proportional hazards model
+scox_PFS <- coxph(sfit_formula, data = cancerData)
+scox_coef_PFS = summary(scox_PFS)$coefficients
+
+
+result_df[,1] = c(test_var_show, control_vars_show)
+result_df[,2] = scox_coef_OS[,2]
+result_df[,3] = summary(scox_OS)$conf.int[,3]
+result_df[,4] = summary(scox_OS)$conf.int[,4]
+result_df[,5] = scox_coef_OS[,5]
+result_df[,6] = scox_coef_PFS[,2]
+result_df[,7] = summary(scox_PFS)$conf.int[,3]
+result_df[,8] = summary(scox_PFS)$conf.int[,4]
+result_df[,9] = scox_coef_PFS[,5]
+
+######### forest plot of OS HR and p-value
+plot_data <- tibble::tibble(mean  = result_df[["HR_OS"]],
+                            lower = result_df[["HR_OS_low"]],
+                            upper = result_df[["HR_OS_up"]],
+                            Variable = result_df$Variable,
+                            effSize = round(result_df[["HR_OS"]],3),
+                            pval = result_df[["p_val_OS"]])
+
+options(scipen = 999)
+P_value_raw = plot_data[['pval']]
+
+pval_vec = vector("character", length(P_value_raw))
+for (i in 1:length(P_value_raw)){
+  pval = P_value_raw[i]
+  if (pval>=0.05){
+    pval_vec[i] = as.character(round(pval,2))
+  }else if (pval>=0.0095){
+    pval_vec[i] = as.character(round(pval,3))
+  }else{
+    pval_vec[i] = format(pval, scientific = TRUE, digits = 2)  # Format for scientific notation
+  }
+}
+
+plot_data$pval = pval_vec
+
+xmin_lim = 0
+xmax_lim = 4
+breaks_x = c(0,1,2,3)
+labels_x = breaks_x
+
+
+pdf_file <- paste0(result_figure_dir,paste0("Forest_HCI002_actCD8Tcm_clinicalVARs_MHR_OS.pdf"))
+fig_width = 5.5
+fig_height = 4.4
+fontSize = 1.2
+xlabel = "HR of OS"
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+plot_data %>%
+  forestplot(labeltext = c("effSize", "Variable", "pval"),
+             graph.pos = 3,
+             boxsize = 0.35,
+             vertices = TRUE,
+             clip = c(xmin_lim, xmax_lim),
+             xlog = FALSE,
+             zero = 1, # dashed line position
+             txt_gp = fpTxtGp(ticks=gpar(cex=fontSize),xlab=gpar(cex=fontSize),label=gpar(cex=fontSize),legend=gpar(cex=fontSize),title=gpar(cex=fontSize)), 
+             xlab = xlabel, # Kaplan-Meier   Multivariable
+             xticks = breaks_x,
+             graphwidth = unit(3, "cm"),
+             lineheight = unit(2, "cm")
+             ) %>%
+  fp_set_style(box = "black",
+               line = "black",
+               align = "llr", # hrz_lines = "#999999"
+               summary = "black") %>%
+  fp_add_header(effSize = c("HR")|> fp_txt_plain() |> fp_align_left(),
+                Variable = c("Variable")|> fp_txt_plain() |> fp_align_left(),
+                pval = c("P-value")|> fp_txt_plain() |> fp_align_right())
+
+dev.off()
+
+
+
+
+######### forest plot of PFS HR and p-value
+plot_data <- tibble::tibble(mean  = result_df[["HR_PFS"]],
+                            lower = result_df[["HR_PFS_low"]],
+                            upper = result_df[["HR_PFS_up"]],
+                            Variable = result_df$Variable,
+                            effSize = round(result_df[["HR_PFS"]],3),
+                            pval = result_df[["p_val_PFS"]])
+
+options(scipen = 999)
+P_value_raw = plot_data[['pval']]
+
+pval_vec = vector("character", length(P_value_raw))
+for (i in 1:length(P_value_raw)){
+  pval = P_value_raw[i]
+  if (pval>=0.05){
+    pval_vec[i] = as.character(round(pval,2))
+  }else if (pval>=0.0095){
+    pval_vec[i] = as.character(round(pval,3))
+  }else{
+    pval_vec[i] = format(pval, scientific = TRUE, digits = 2)  # Format for scientific notation
+  }
+}
+plot_data$pval = pval_vec
+
+xmin_lim = 0
+xmax_lim = 4
+breaks_x = c(0,1,2,3)
+labels_x = breaks_x
+
+
+pdf_file <- paste0(result_figure_dir,paste0("Forest_HCI002_actCD8Tcm_clinicalVARs_MHR_PFS.pdf"))
+xlabel = "HR of PFS"
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+plot_data %>%
+  forestplot(labeltext = c("effSize", "Variable", "pval"),
+             graph.pos = 3,
+             boxsize = 0.35,
+             vertices = TRUE,
+             clip = c(xmin_lim, xmax_lim),
+             xlog = FALSE,
+             zero = 1, 
+             txt_gp = fpTxtGp(ticks=gpar(cex=fontSize),xlab=gpar(cex=fontSize),label=gpar(cex=fontSize),legend=gpar(cex=fontSize),title=gpar(cex=fontSize)), 
+             xlab = xlabel, # Kaplan-Meier   Multivariable
+             xticks = breaks_x,
+             graphwidth = unit(3, "cm"),
+             lineheight = unit(2, "cm")
+             ) %>%
+  fp_set_style(box = "black",
+               line = "black",
+               align = "llr", # hrz_lines = "#999999"
+               summary = "black") %>%
+  fp_add_header(effSize = c("HR")|> fp_txt_plain() |> fp_align_left(),
+                Variable = c("Variable")|> fp_txt_plain() |> fp_align_left(),
+                pval = c("P-value")|> fp_txt_plain() |> fp_align_right())
+
+dev.off()
+
+```
+
+# Figure 3H. Activated CD8Tcm signature score distribution among 4 groups of irAE and ICBR (HCI002)
+```{r}
+
+feature_test <- "CD8T_CM_tripletORp_ratio_baseline"  # CD8T_CM_tripletORp_ratio_baseline
+predictor_df <- HCI002_all_info[c(feature_test, "IRAEactionable01", "Response01")]
+predictor_df <- na.omit(predictor_df)
+
+# Step 1: Create the group variable
+predictor_df <- predictor_df %>%
+  mutate(Group = case_when(
+    IRAEactionable01 == 1 & Response01 == 1 ~ "sTOX,CB", # "sTOX,R"
+    IRAEactionable01 == 0 & Response01 == 1 ~ "nsTOX,CB", # "nsTOX,R"
+    IRAEactionable01 == 1 & Response01 == 0 ~ "sTOX,NB", # "sTOX,NR"
+    IRAEactionable01 == 0 & Response01 == 0 ~ "nsTOX,NB" # "nsTOX,NR"
+  ))
+
+# Step 2: Set factor levels to control group order
+predictor_df$Group <- factor(predictor_df$Group, levels = c("nsTOX,CB", "nsTOX,NB", "sTOX,CB", "sTOX,NB")) # "nsTOX,R", "nsTOX,NR", "sTOX,R", "sTOX,NR"
+
+# Step 3: Plot boxplot
+ggplot(predictor_df, aes(x = Group, y = CD8T_CM_tripletORp_ratio_baseline*100)) +
+  geom_boxplot(fill = "steelblue", outlier.shape = NA) +  # outlier.shape = NA to hide points (optional)
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +      # optional: show individual points
+  ylab("% activated CD8+ TCM / CD8+ TCM") +
+  xlab("") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 12)
+  )
+
+
+pdf_file <- paste0(result_figure_dir,paste0("Boxplot_actCD8TCM_4groups_HCI002.pdf")) 
+fig_width = 2
+fig_height = 3.5
+fontSize = 1.2
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(predictor_df, aes(x = Group, y = CD8T_CM_tripletORp_ratio_baseline*100)) +
+  # Jittered individual points
+  geom_jitter(
+    width = 0.15,
+    size = 1.8,
+    alpha = 0.6,
+    color = "black"
+  ) +
+  # Boxplot with subtle outline and no outliers
+  geom_boxplot(
+    fill = "#2C7BB6",        # a refined steelblue tone
+    color = "black",
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.9
+  ) +
+  ylab("% activated CD8+ TCM / CD8+ TCM") +
+  xlab("") +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color="black"),
+        axis.line.x = element_line(color="black"),
+        axis.ticks.y = element_line(color="black"),
+        axis.ticks.x = element_line(color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+        panel.border = element_blank(), # remove top and right border lines
+        )
+dev.off()
+
+wilcox.test(predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="nsTOX,CB"], predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="nsTOX,NB"])
+
+wilcox.test(predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="nsTOX,CB"], predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="sTOX,CB"])
+
+wilcox.test(predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="nsTOX,CB"], predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="sTOX,NB"])
+
+wilcox.test(predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="nsTOX,NB"], predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="sTOX,NB"])
+
+wilcox.test(predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="sTOX,CB"], predictor_df$CD8T_CM_tripletORp_ratio_baseline[predictor_df$Group=="sTOX,NB"])
+
+
+```
+
+
+
+# SFigure 4F. K-M survival curves to test whether the signatures could predict OS (HCI001)
+```{r}
+
+feature_test <- "CD8T_CM_tripletORp_ratio_Baseline"  
+exp_cutoff_method <- "abs" 
+phenotype_str <- "OS" 
+y_label_str <- "Overall \nsurvival probability" 
+
+# get the predictor from the HCI001_all_info
+predictor_df <- HCI001_all_info[c("RedCap ID",feature_test)]
+predictor_df <- na.omit(predictor_df)
+predictor_df <- predictor_df[!duplicated(predictor_df$`RedCap ID`), ]
+
+## load survival information
+survival_info_df <- read_excel("HCI001 clinical data 11.15.22 updated 4.15.24.xlsx")
+survival_info_df <- survival_info_df[c("RedCap ID", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event")]
+survival_info_df <- survival_info_df[!duplicated(survival_info_df$`RedCap ID`), ]
+survival_all_info_HCI001 <- merge(predictor_df, survival_info_df, by = "RedCap ID", x.all = T)
+
+survival_all_info_HCI001 <- survival_all_info_HCI001[!is.na(survival_all_info_HCI001[[feature_test]]), ]
+
+## convert days to months
+survival_all_info_HCI001$OS_event <- as.numeric(survival_all_info_HCI001$OS_event)
+survival_all_info_HCI001$PFS_event <- as.numeric(survival_all_info_HCI001$PFS_event)
+survival_all_info_HCI001$OS_time <- as.numeric(survival_all_info_HCI001$OS_time) / 30
+survival_all_info_HCI001$PFS_time <- as.numeric(survival_all_info_HCI001$PFS_time) / 30
+
+############# Survival test for OS
+Score_Pred = survival_all_info_HCI001[[feature_test]]
+Score=Score_Pred
+if (exp_cutoff_method == "quantile"){
+  exp_cutoff = quantile(Score_Pred, 0.5)
+}else if (exp_cutoff_method == "abs"){
+  exp_cutoff = 0.04
+}
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+cancerData=data.frame(Score,survival_all_info_HCI001[[paste0(phenotype_str, "_time")]],survival_all_info_HCI001[[paste0(phenotype_str, "_event")]])
+colnames(cancerData) = c("Score","OS_time","OS_event")
+
+sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+scox_coef = summary(scox)$coefficients
+HR_value = scox_coef[2] # hazard ratio
+Z_value=scox_coef[4]
+P_value=scox_coef[5]
+HR_CI = summary(scox)$conf.int[3:4]
+
+##### plot
+fontSize = 12
+survp=ggsurvplot(
+  sfit,
+  data = cancerData,
+  size = 1,                 # change line size
+  palette =
+    c("#00305d", "#9c1915"),# custom color palettes
+  conf.int = FALSE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  xlim = c(-3,50),
+  ylim=c(0,1),
+  xlab = "Time (months)", ylab= y_label_str,# 
+  break.time.by = 10,
+  risk.table=TRUE,
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  risk.table.pos="out",
+  risk.table.col="black",
+  risk.table.y.text = FALSE,
+  tables.y.text = FALSE, 
+  tables.theme = theme_cleantable(),
+  legend.labs =c("Low", "High"),    # Change legend labels
+  legend.title="",
+  legend = c(0.75, 0.975), # legend relative position
+  font.main = c(fontSize),
+  font.caption = c(fontSize),
+  font.legend = c(fontSize),
+  font.tickslab = c(fontSize),
+  font.x = c(fontSize),
+  font.y = c(fontSize),
+  ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                 plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                 panel.background = element_rect(fill = "white"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                 axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+) 
+survp$plot = survp$plot+ 
+            ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+pdf(paste0(result_figure_dir, "KM_curve_",phenotype_str,"_",feature_test,"_HCI001.pdf"),width=3.3, height=3)
+print(survp, newpage = FALSE)
+dev.off()
+
+```
+
+# SFigure 4A. plot AUC comparison of different irAE types (in HCI001 and HCI002)
+```{r}
+
+dataset <- "HCI001" # HCI001 HCI002
+
+if (dataset == "HCI001"){
+  plot_df <- AUC_irAEs_df_HCI001
+}else if (dataset == "HCI002"){
+  plot_df <- AUC_irAEs_df_HCI002
+}
+
+# Convert p-values to strings for annotation
+plot_df <- plot_df %>% 
+  mutate(
+    irAE_pval_str = sapply(irAE_pval, function(p) {
+      if (p == 0) return("p==0")
+      exp10  <- floor(log10(p))
+      coef   <- signif(p / 10^exp10, 2)
+      # paste into a string that ggplot2 will parse as plotmath:
+      sprintf("p==%s%%*%%10^%s", coef, exp10)
+    })
+  )
+# Filter to selected irAE types
+selected_types <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01")
+plot_df <- plot_df[plot_df$irAE_type %in% selected_types, ]
+# Define mapping as a named vector
+mapping <- c(
+  "IRAE_GI01"  = "Gastrointestinal",
+  "IRAE_HB01"  = "Hepatobiliary",
+  "IRAE_skin01" = "Skin",
+  "IRAE_MSK01"  = "Musculoskeletal"
+)
+# Apply mapping to irAE_type
+plot_df$irAE_type <- mapping[plot_df$irAE_type]
+
+
+
+# Plot
+fig_width = 2
+fig_height = 3.5
+pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_irAE_types_",dataset,".pdf")) 
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(plot_df, aes(x = irAE_type, y = irAE_AUC, fill = irAE_type)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_errorbar(
+    aes(ymin = irAE_AUC_lower, ymax = irAE_AUC_upper),
+    width = 0.2,              # width of the error bar ends
+    color = "black",          # color of the error bars
+    linewidth = 0.5
+    ) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+  labs(title = "", x = "", y = "AUC") +
+  ylim(0, 1) + # 1.5
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.ticks.y = element_line(color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black", angle = 47, hjust = 1),
+        panel.border = element_blank(), legend.position = "none") +
+  guides(color = guide_legend(override.aes = list(size = 5), nrow = 1)) 
+dev.off()
+
+```
+
+# SFigure 4B-C. Plot comparison of difference of activated CD8TCM cell abundance in different sex, age, ICB experience, ... groups (in HCI002)
+```{r}
+
+# Input
+feature_test <- "CD8T_CM_tripletORp_ratio_baseline"
+feature_test_show <- "% activated CD8+ TCM"
+dataset_test <- "HCI002"  
+
+# Select appropriate dataset
+if (dataset_test == "HCI002") {
+  all_info_for_plot <- HCI002_all_info
+} else if (dataset_test == "HCI001") {
+  all_info_for_plot <- HCI001_all_info
+}
+
+# Predictor
+actCD8TCM_vec <- all_info_for_plot[[feature_test]]
+
+# Categorical (group) variables
+sex_vec <- all_info_for_plot[["Gender"]]
+stage_vec <- all_info_for_plot[["Baseline Stage / TNM"]]
+stage_vec[grepl("IV", stage_vec)] <- 4
+stage_vec[grepl("III", stage_vec)] <- 3
+stage_vec[grepl("II", stage_vec)] <- 2
+stage_vec[grepl("I", stage_vec)] <- 1
+stage_vec <- as.numeric(stage_vec)
+
+ICBnaive_vec <- all_info_for_plot[["ICI Naïve?"]]
+IPIdrug_vec <- all_info_for_plot[["Drug"]]
+BRAFmut_vec <- all_info_for_plot[["BRAF Mutation"]]
+BRAFmut_vec[(!grepl("V600E|V600K|Wildtype", BRAFmut_vec)) & !is.na(BRAFmut_vec)] <- "Other mut."
+BRAFmut_vec[is.na(BRAFmut_vec)] <- "Unknown"
+
+# Continuous variables
+continuous_vars <- list(
+  Age = all_info_for_plot[["Age at C1"]],
+  TMB = all_info_for_plot[["TMB (mutation /mb)"]],
+  PDL1_TPS = all_info_for_plot[["PD-L1 TPS"]],
+  PDL1_CPS = all_info_for_plot[["PD-L1 CPS"]]
+)
+
+continuous_vars_show <- c("Age", "TMB (mut. / Mb)", "PDL1 TPS (%)", "PDL1 CPS (%)")
+
+# Plot correlations: scatter plots for continuous variables
+for (var_name_i in 1:length(continuous_vars)) {
+  var_name <- names(continuous_vars)[var_name_i]
+  var_name_show <- continuous_vars_show[var_name_i]
+  var_vec <- continuous_vars[[var_name]]
+  plot_df <- data.frame(Predictor = actCD8TCM_vec, Variable = var_vec)
+
+  pdf_name <- paste0(result_figure_dir, "scatter_", dataset_test, "_", feature_test, "_vs_", var_name, ".pdf")
+  p <- ggplot(plot_df, aes(x = Variable, y = Predictor)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") +
+    labs(title = "",
+         x = var_name_show,
+         y = feature_test_show) +
+    theme_minimal() +
+      theme(
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white", color = NA),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.line.y = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black")
+      )
+
+  ggsave(pdf_name, plot = p, width = 2.1, height = 2.4)
+}
+
+# Bar plots: categorical variables
+group_vars <- list(
+  Gender = sex_vec,
+  Stage = stage_vec,
+  `ICB naive` = ICBnaive_vec,
+  Drug = IPIdrug_vec,
+  BRAF = BRAFmut_vec
+)
+
+for (var_name in names(group_vars)) {
+  var_vec <- as.factor(group_vars[[var_name]])
+  plot_df <- data.frame(Predictor = actCD8TCM_vec, Group = var_vec)
+
+  pdf_name <- paste0(result_figure_dir, "barplot_", dataset_test, "_", feature_test, "_vs_", var_name, ".pdf")
+  p <- ggplot(plot_df, aes(x = Group, y = Predictor)) +
+    geom_boxplot(outlier.shape = NA, fill = "lightgray", color = "black") +
+    geom_jitter(width = 0.2, size = 1, aes(color = Group)) +
+    #stat_compare_means(method = "wilcox.test") +
+    labs(title = "",
+         x = var_name,
+         y = feature_test_show) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.border = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.line.x = element_line(color = "black"),
+      axis.line.y = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+      legend.position = "none"
+    )
+  ggsave(pdf_name, plot = p, width = 1.5, height = 3)
+}
+
+### statistical test 
+wilcox_results <- data.frame(Variable = character(), P_value = numeric(), stringsAsFactors = FALSE)
+
+for (var_name in names(group_vars)) {
+  group_vec <- group_vars[[var_name]]
+
+  # Skip if all NA
+  if (all(is.na(group_vec))) next
+
+  # Clean/transform specific variables
+  if (var_name == "Stage") {
+    # Merge stage 2 and 3 → "Mid", stage 4 → "High"
+    group_vec <- ifelse(group_vec %in% c(2, 3), "Mid", 
+                        ifelse(group_vec == 4, "High", NA))
+  } else if (var_name == "BRAF") {
+    # Group Wildtype vs Mutant (non-Wildtype)
+    group_vec <- ifelse(group_vec == "Wildtype", "Wildtype", 
+                        ifelse(!is.na(group_vec), "Mutant", NA))
+  }
+
+  # Remove NAs
+  valid_idx <- !is.na(actCD8TCM_vec) & !is.na(group_vec)
+  vec <- actCD8TCM_vec[valid_idx]
+  grp <- group_vec[valid_idx]
+
+  # Run test only if 2 unique groups
+  if (length(unique(grp)) == 2) {
+    test_result <- wilcox.test(vec ~ grp)
+    p_val <- test_result$p.value
+  } else {
+    p_val <- NA
+  }
+
+  # Save result
+  wilcox_results <- rbind(wilcox_results, data.frame(Variable = var_name, P_value = p_val))
+}
+
+# View results
+print(wilcox_results)
+
+```
+
+# SFigure 4B. Plot AUC comparison of different drug types: IPI vs non-IPI containing, ICB naive vs experienced, stage 4 vs 1-3 (in HCI002)
+```{r}
+
+AUC_subpopulation_df_HCI002 = data.frame(irAE_type = c("PD1/PDL1", "CTLA4-containing", "ICB-naive", "ICB-experienced", "stage I-III", "stage IV", "Active treatment", "Adjuvant"), # "Adjuvant/Neoadjuvant"
+                          irAE_AUC = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_lower = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_upper = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          irAE_pval = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          sample_size = c(NA, NA, NA, NA, NA, NA, NA, NA))
+
+#### compare AUCs of different subpopulations
+AUC_subpopulation_all_info_df <- HCI002_all_info[c(feature_test, "Drug", "ICI Naïve?", "Baseline Stage / TNM", "IRAEactionable01", "TherapyType")]
+colnames(AUC_subpopulation_all_info_df) <- c("Feature", "Drug", "ICB-naive", "Stage_raw", "Phenotype", "TherapyType")
+AUC_subpopulation_all_info_df$Stage <- "Stage I-III"
+AUC_subpopulation_all_info_df$Stage[grepl("IV", AUC_subpopulation_all_info_df$Stage_raw)] <- "Stage IV"
+AUC_subpopulation_all_info_df$`ICB-naive`[AUC_subpopulation_all_info_df$`ICB-naive` == "Yes"] <- "ICB-naive"
+AUC_subpopulation_all_info_df$`ICB-naive`[AUC_subpopulation_all_info_df$`ICB-naive` == "No"] <- "ICB-experienced"
+AUC_subpopulation_all_info_df$TherapyType[AUC_subpopulation_all_info_df$TherapyType %in% c("Adjuvant")] <- "Adjuvant"
+AUC_subpopulation_all_info_df$TherapyType[AUC_subpopulation_all_info_df$TherapyType %in% c("Neoadjuvant")] <- "Neoadjuvant"
+AUC_subpopulation_all_info_df$TherapyType[AUC_subpopulation_all_info_df$TherapyType %in% c("Active")] <- "Active treatment"
+
+predictor <- AUC_subpopulation_all_info_df$Feature
+response <- AUC_subpopulation_all_info_df$Phenotype
+
+subpopulation_grouping = c("Drug", "ICB-naive", "Stage", "TherapyType")
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+p_vec = c()
+sample_size = c()
+for (sg in subpopulation_grouping){
+  if (sg == "Drug"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "PD1/PDL1"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "CTLA4-containing"
+  }else if (sg == "ICB-naive"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "ICB-naive"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "ICB-experienced"
+  }else if (sg == "Stage"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "Stage I-III"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "Stage IV"
+  }else if (sg == "TherapyType"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "Active treatment"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "Adjuvant"
+  }
+  roc_obj <- roc(response[index_1], predictor[index_1], direction="<",levels=c(0, 1))
+  AUC_ci <- ci.auc(roc_obj)
+  AUC_vec = c(AUC_vec, AUC_ci[2])
+  AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+  AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  auc_p=roc.area(response[index_1], predictor[index_1])
+  p_val = auc_p$p.value
+  p_vec = c(p_vec, p_val)
+  sample_size = c(sample_size, sum(!(is.na(response[index_1])) & !(is.na(predictor[index_1]))))
+  
+  roc_obj <- roc(response[index_2], predictor[index_2], direction="<",levels=c(0, 1))
+  AUC_ci <- ci.auc(roc_obj)
+  AUC_vec = c(AUC_vec, AUC_ci[2])
+  AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+  AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  auc_p=roc.area(response[index_2], predictor[index_2])
+  p_val = auc_p$p.value
+  p_vec = c(p_vec, p_val)
+  sample_size = c(sample_size, sum(!(is.na(response[index_2])) & !(is.na(predictor[index_2]))))
+}
+AUC_subpopulation_df_HCI002$irAE_AUC = AUC_vec
+AUC_subpopulation_df_HCI002$irAE_AUC_lower = AUC_low_vec
+AUC_subpopulation_df_HCI002$irAE_AUC_upper = AUC_up_vec
+AUC_subpopulation_df_HCI002$irAE_pval = p_vec
+AUC_subpopulation_df_HCI002$sample_size = sample_size
+
+
+#### AUC barplot
+for (test_subgrouping in subpopulation_grouping){
+  if (test_subgrouping == "Drug"){
+    plot_df = AUC_subpopulation_df_HCI002[1:2,]
+  }else if (test_subgrouping == "ICB-naive"){
+    plot_df = AUC_subpopulation_df_HCI002[3:4,]
+  }else if (test_subgrouping == "Stage"){
+    plot_df = AUC_subpopulation_df_HCI002[5:6,]
+  }else if (test_subgrouping == "TherapyType"){
+    plot_df = AUC_subpopulation_df_HCI002[7:8,]
+  }
+  plot_df$irAE_type <- paste0(plot_df$irAE_type, "\n(n=", plot_df$sample_size, ")")
+  
+  # Convert p-values to strings for annotation
+  plot_df <- plot_df %>% 
+    mutate(
+      irAE_pval_str = sapply(irAE_pval, function(p) {
+        if (p == 0) return("p==0")
+        exp10  <- floor(log10(p))
+        coef   <- signif(p / 10^exp10, 2)
+        sprintf("p==%s%%*%%10^%s", coef, exp10)
+      })
+    )
+  
+  # Plot
+  fig_width = 2
+  fig_height = 3.5
+  pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_subgroups_",test_subgrouping,"_HCI002.pdf")) 
+  pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+  p <- ggplot(plot_df, aes(x = irAE_type, y = irAE_AUC, fill = irAE_type)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_errorbar(
+      aes(ymin = irAE_AUC_lower, ymax = irAE_AUC_upper),
+      width = 0.2,              # width of the error bar ends
+      color = "black",          # color of the error bars
+      linewidth = 0.5
+      ) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+    labs(title = "", x = "", y = "AUC") +
+    ylim(0, 1) + # 1.5
+    theme(panel.grid = element_blank(), 
+          panel.background = element_rect(fill = "white"),
+          axis.line.y = element_line(color = "black"),
+          axis.line.x = element_line(color = "black"),
+          axis.ticks.y = element_line(color = "black"),
+          axis.ticks.x = element_line(color = "black"),
+          axis.text.y = element_text(color = "black"),
+          axis.text.x = element_text(color = "black", angle = 47, hjust = 1),
+          panel.border = element_blank(), legend.position = "none") +
+    guides(color = guide_legend(override.aes = list(size = 5), nrow = 1)) 
+  print(p) 
+  dev.off()
+}
+
+```

@@ -1,0 +1,651 @@
+---
+title: "Correlate CyTOF and OLINK features on HCI002"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+####### This script makes the below displays for the paper
+## Figure 1F-G
+## Figure 3F
+## SFigure 1C-D
+## SFigure 5H
+
+```{r setup, include=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+```
+
+# load required package
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(viridis)
+library(tidyr)
+library(pROC)
+library(verification)
+library(reshape2)
+library(ggpubr)
+
+library(dplyr)
+library(survival)
+library(survminer)
+
+library(ggrepel) 
+library(glmnet)
+library(caret)
+library(pROC)
+library(ranger)
+library(readr)
+
+library(AnnotationDbi)
+library(org.Hs.eg.db) 
+library(ReactomePA)
+library(enrichplot)
+library(gridExtra)
+library(clusterProfiler)
+library(msigdbr)
+
+library(VennDiagram)
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(corrr)
+
+library(RColorBrewer)
+library(msigdbr)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+
+```
+
+# common functions and parameters
+```{r}
+
+# Create a function to make olink gene names unique
+make_unique <- function(names) {
+  # Initialize an empty vector to store unique names
+  unique_names <- character(length(names))
+  # Create a named vector to count occurrences
+  name_count <- table(names)
+  # Track the current count of each name
+  name_tracker <- setNames(rep(0, length(name_count)), names(name_count))
+  # Iterate over the names and create unique ones
+  for (i in seq_along(names)) {
+    name <- names[i]
+    # If this name is duplicated, append the appropriate number
+    if (name_tracker[name] > 0) {
+      new_name <- paste0(name, "_", name_tracker[name] + 1)
+    } else {
+      new_name <- name
+    }
+    # Assign the unique name
+    unique_names[i] <- new_name
+    # Increment the tracker for this name
+    name_tracker[name] <- name_tracker[name] + 1
+  }
+  return(unique_names)
+}
+
+convert_label_genes <- function(label_genes) {
+  label_genes_show <- sapply(label_genes, function(x) {
+    parts <- unlist(strsplit(x, " > "))
+    part1 <- gsub("_", "", parts[1])
+    if (!(grepl("neg$", parts[2]))){
+      part2 <- paste0(gsub("_", "+", parts[2]), "+")
+    }else{
+      part2 <- paste0(gsub("_", "+", parts[2]))
+    }
+    
+    paste(part2, part1)
+  })
+  label_genes_show <- gsub("^NA\\+\\s*", "", label_genes_show)
+  label_genes_show <- gsub("neg", "-", label_genes_show)
+  label_genes_show <- gsub("TCM", "Tcm", label_genes_show)
+  label_genes_show <- gsub("TEMRA", "Temra", label_genes_show)
+  label_genes_show <- gsub("TEM", "Tem", label_genes_show)
+  label_genes_show <- gsub("NAIVE", "naive", label_genes_show)
+  label_genes_show <- gsub("TFH", "Tfh", label_genes_show)
+  label_genes_show <- gsub("MONO", "Mono", label_genes_show)
+  label_genes_show <- gsub("TSCM", "Tscm", label_genes_show)
+  label_genes_show <- gsub("TREG", "Treg", label_genes_show)
+  label_genes_show <- gsub("BREG", "Breg", label_genes_show)
+  return(label_genes_show)
+}
+
+
+# Define the Venn plot function
+plot_venn_three_sets <- function(vec1, vec2, vec3, fig_name) {
+  # Create named list
+  venn_list <- list(
+    AUC = vec1,
+    `Odds ratio`  = vec2,
+    `Fold Change`  = vec3
+  )
+  # Generate Venn plot object
+  venn.plot <- venn.diagram(
+    x = venn_list,
+    filename = NULL,            # Create object, not file
+    output = TRUE,
+    log.filename = NULL,        # Suppresses .log file creation
+    imagetype = "pdf",
+    compression = "lzw",
+    fill = c("#E41A1C", "#377EB8", "#4DAF4A"),
+    alpha = 0.5,
+    cat.names = NULL,    # No names
+    cat.cex = 0,              # No category text size cat.cex = 1.5,
+    cat.pos = 0,              # No label position
+    cex = 1.5,
+    fontfamily = "sans",
+    cat.fontfamily = "sans",
+    cat.dist = 0.05
+  )
+  # Save to PDF
+  pdf(file = fig_name, width = 3.5, height = 3.5)
+  grid.draw(venn.plot)
+  dev.off()
+}
+
+# Function to create multiple box plots comparing cell abundance in irAE vs non-irAE patients
+plot_cell_boxplots <- function(df, cell_pattern, cell_display_name, ymax = 2, ylabel_height = 1.7, ytickstep = 0.5, labeltextadd = 0.25, phenotype = "Severe irAE") {
+  if (phenotype == "Severe irAE"){
+    plot_df <- data.frame(
+      Pre = df[[paste0(cell_pattern, "baseline")]]/100,
+      On = df[[paste0(cell_pattern, "ontreat")]]/100,
+      FC = df[[paste0(cell_pattern, "FC_on_pre")]],
+      IRAE = factor(df$IRAEactionable01)
+    ) %>% melt(id.vars = "IRAE", variable.name = "Group", value.name = "Value")
+  }else if (phenotype == "Response"){
+    plot_df <- data.frame(
+      Pre = df[[paste0(cell_pattern, "baseline")]]/100,
+      On = df[[paste0(cell_pattern, "ontreat")]]/100,
+      FC = df[[paste0(cell_pattern, "FC_on_pre")]],
+      IRAE = factor(df$Response01)
+    ) %>% melt(id.vars = "IRAE", variable.name = "Group", value.name = "Value")
+  }
+  
+  plot_df <- na.omit(plot_df)
+  
+  # Ensure the x-axis factor is properly ordered
+  plot_df <- plot_df %>%
+    mutate(
+      Group = factor(Group, levels = c("Pre", "On", "FC")),
+      Combo = interaction(Group, IRAE, sep = "."),
+      Combo = factor(Combo, levels = c("Pre.0", "Pre.1", "On.0", "On.1", "FC.0", "FC.1")),
+      x_pos = as.numeric(Combo)  # numeric x-axis for positioning
+    )
+  # Define comparisons for p-values
+  comparisons <- list(c("Pre.0", "Pre.1"), c("On.0", "On.1"), c("FC.0", "FC.1"))
+  
+  # Function to convert p-value to symbol
+  p_to_symbol <- function(p) {
+    if (is.na(p)) return("ns")
+    if (p < 0.001) return("***")
+    else if (p < 0.01) return("**")
+    else if (p < 0.05) return("*")
+    else return("ns")
+  }
+  
+  # Calculate p-values and significance symbols
+  pvals <- sapply(comparisons, function(pair) {
+    data1 <- plot_df$Value[plot_df$Combo == pair[1]]
+    data2 <- plot_df$Value[plot_df$Combo == pair[2]]
+    if (length(data1) > 0 && length(data2) > 0) {
+      tryCatch(
+        wilcox.test(data1, data2)$p.value,
+        error = function(e) NA
+      )
+    } else {
+      NA
+    }
+  })
+  significance_labels <- sapply(pvals, p_to_symbol)
+  
+  # Now plot
+  p <- ggplot(plot_df, aes(x = x_pos, y = Value, fill = IRAE, group = Combo)) + # x_pos Combo
+    geom_jitter(width = 0.15, size = 0.5, alpha = 0.7) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    scale_x_continuous(
+      breaks = c(1.5, 3.5, 5.5),              # middle of each group (two bars)
+      labels = c("Pre", "On", "FC"), # c("Pre-treatment", "On-treatment", "Fold change")
+      expand = expansion(add = 0.4)
+    ) +
+    scale_fill_manual(values = c("0" = "#4E79A7", "1" = "#F28E2B"), name = phenotype, labels = c("No", "Yes")) +
+    labs(title = cell_display_name, x = "", y = "", fill = "IRAE") + # y = "Cell abundance or fold change"
+    coord_cartesian(ylim = c(0, ymax)) +
+    scale_y_sqrt(breaks = seq(0, ymax, by = ytickstep)) +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(size = 9, hjust = 0.5),
+          axis.text = element_text(color = "black"))
+  
+  # X-axis positions of the Combo levels
+  comparison_pairs <- list(c(1, 2), c(3, 4), c(5, 6))
+  
+  # Add fixed-height significance bars with uniform tick length
+  y_sig <- ylabel_height
+  tick_len <- 0.04
+  
+  for (i in seq_along(comparison_pairs)) {
+    pair <- comparison_pairs[[i]]
+    p <- p +
+      annotate("segment", x = pair[1], xend = pair[2], y = y_sig, yend = y_sig, size = 0.5) +  # horizontal bar
+      annotate("segment", x = pair[1], xend = pair[1], y = y_sig, yend = y_sig - tick_len, size = 0.4) +  # left tick
+      annotate("segment", x = pair[2], xend = pair[2], y = y_sig, yend = y_sig - tick_len, size = 0.4) +  # right tick
+      annotate("text", x = mean(pair), y = y_sig + labeltextadd, label = significance_labels[i]) # , size = 4
+  }
+  return(p)
+}
+
+```
+
+# load data 
+```{r}
+### load HCI002 data
+HCI002_all_info <- read_csv(file = paste0(data_dir, "HCI002_all_info_20241008.csv"), name_repair = "minimal") 
+HCI002_map_df = read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+
+```
+
+# Prepare cor. data (CyTOF, OLINK)
+```{r}
+
+HCI002_filtered_info = HCI002_all_info[60:25931]
+feature_names <- colnames(HCI002_filtered_info)
+######### baseline
+CyTOF_baseline_ind <- (grepl("FC_baseline", feature_names) & !grepl("_ABS$", feature_names) & !grepl("IGG4", feature_names))
+OLINK_baseline_ind <- (grepl("OID", feature_names) & grepl("baseline", feature_names))
+
+CyTOF_baseline_data <- as.matrix(HCI002_filtered_info[CyTOF_baseline_ind])
+colnames(CyTOF_baseline_data) <- gsub("_FC_baseline.*", "", colnames(CyTOF_baseline_data))
+
+OLINK_baseline_data <- as.matrix(HCI002_filtered_info[OLINK_baseline_ind])
+colnames(OLINK_baseline_data) <- gsub("_OLINK_baseline", "", colnames(OLINK_baseline_data))
+mapped_names <- proteins_mapping[colnames(OLINK_baseline_data)]
+# Handle unmapped IDs (optional, but recommended for robustness)
+mapped_names[is.na(mapped_names)] <- colnames(OLINK_baseline_data)[is.na(mapped_names)]
+colnames(OLINK_baseline_data) <- mapped_names
+OLINK_baseline_data <- OLINK_baseline_data[, !duplicated(colnames(OLINK_baseline_data))]
+
+
+######### ontreat
+CyTOF_ontreat_ind <- (grepl("FC_ontreat", feature_names) & !grepl("_ABS$", feature_names) & !grepl("IGG4", feature_names))
+OLINK_ontreat_ind <- (grepl("OID", feature_names) & grepl("ontreat", feature_names))
+
+CyTOF_ontreat_data <- as.matrix(HCI002_filtered_info[CyTOF_ontreat_ind])
+colnames(CyTOF_ontreat_data) <- gsub("_FC_ontreat.*", "", colnames(CyTOF_ontreat_data))
+
+OLINK_ontreat_data <- as.matrix(HCI002_filtered_info[OLINK_ontreat_ind])
+colnames(OLINK_ontreat_data) <- gsub("_OLINK_ontreat", "", colnames(OLINK_ontreat_data))
+mapped_names <- proteins_mapping[colnames(OLINK_ontreat_data)]
+# Handle unmapped IDs (optional, but recommended for robustness)
+mapped_names[is.na(mapped_names)] <- colnames(OLINK_ontreat_data)[is.na(mapped_names)]
+colnames(OLINK_ontreat_data) <- mapped_names
+OLINK_ontreat_data <- OLINK_ontreat_data[, !duplicated(colnames(OLINK_ontreat_data))]
+
+
+######### fold change
+CyTOF_FC_ind <- (grepl("FC_FC", feature_names) & !grepl("_ABS$", feature_names) & !grepl("IGG4", feature_names))
+OLINK_FC_ind <- (grepl("OID", feature_names) & grepl("_FC_on_pre", feature_names))
+
+CyTOF_FC_data <- as.matrix(HCI002_filtered_info[CyTOF_FC_ind])
+colnames(CyTOF_FC_data) <- gsub("_FC_FC.*", "", colnames(CyTOF_FC_data))
+
+OLINK_FC_data <- as.matrix(HCI002_filtered_info[OLINK_FC_ind])
+colnames(OLINK_FC_data) <- gsub("_OLINK_FC_on_pre", "", colnames(OLINK_FC_data))
+mapped_names <- proteins_mapping[colnames(OLINK_FC_data)]
+# Handle unmapped IDs (optional, but recommended for robustness)
+mapped_names[is.na(mapped_names)] <- colnames(OLINK_FC_data)[is.na(mapped_names)]
+colnames(OLINK_FC_data) <- mapped_names
+OLINK_FC_data <- OLINK_FC_data[, !duplicated(colnames(OLINK_FC_data))]
+
+```
+
+# Figure 1F-G/SFigure 1C-D. Make cor. heatmap within CyTOF or OLINK 
+```{r}
+
+modality <- "OLINK" # CyTOF OLINK
+timePt <- "On" # Pre On FC
+
+if (modality == "CyTOF"){
+  if (timePt == "Pre"){
+    data_df <- CyTOF_baseline_data
+  }else if (timePt == "On"){
+    data_df <- CyTOF_ontreat_data
+  }else if (timePt == "FC"){
+    data_df <- CyTOF_FC_data
+  }
+}else if (modality == "OLINK"){
+  if (timePt == "Pre"){
+    data_df <- OLINK_baseline_data
+  }else if (timePt == "On"){
+    data_df <- OLINK_ontreat_data
+  }else if (timePt == "FC"){
+    data_df <- OLINK_FC_data
+  }
+}
+
+# Count NAs in each column
+na_counts <- colSums(is.na(data_df))
+# Calculate threshold (more than 50% NAs)
+na_threshold <- nrow(data_df) * 0.5
+# Filter columns with <= 50% NAs
+data_df <- data_df[, na_counts <= na_threshold]
+
+# Compute the correlation matrix
+correlation_matrix <- cor(data_df, use = "complete.obs", method = "spearman")
+# Remove rows and cols where all values are NA
+correlation_matrix <- correlation_matrix[rowSums(is.na(correlation_matrix)) != ncol(correlation_matrix)-1, ]
+correlation_matrix <- correlation_matrix[, colSums(is.na(correlation_matrix)) != nrow(correlation_matrix)]
+
+correlation_matrix0 <- correlation_matrix
+
+### Define genes to show
+if (modality == "CyTOF"){
+  genes_show <- c("T_CELL", "GDT", "B_CELL", "B_NAIVE", "B_MEM", "PB", "NK", "MONO", "DC", "NKT", "DPT", "DNT", "CD8_T", "CD8_TNAIVE", "CD8_TCM", "CD8_TEM", "CD8_TEMRA", "TREG", "CD4_TNAIVE", "CD4_TCM", "CD4_TEM") 
+  labels_show <- c("T", "gdT", "B", "Bnaive", "Bmemory", "Plasma", "NK", "Monocytes", "DC", "NKT", "DPT", "DNT", "CD8+ T", "CD8+ Tnaive", "CD8+ Tcm", "CD8+ Tem", "CD8+ Temra", "Tregs", "CD4+ Tnaive", "CD4+ Tcm", "CD4+ Tem") 
+}else if (modality == "OLINK"){
+  genes_show <- c("CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10", "IL12A", "IL21", "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19", "PGF")
+  genes_show <- genes_show[(genes_show %in% rownames(correlation_matrix))]
+  labels_show <- genes_show
+
+  set.seed(123)  # for reproducibility
+  # Get all available gene names
+  all_genes <- rownames(correlation_matrix)
+  # Exclude the genes_show from sampling pool to avoid duplication
+  remaining_genes <- setdiff(all_genes, genes_show)
+  # Calculate how many more genes to sample
+  n_to_sample <- 1000 - length(genes_show)
+  # Sample the remaining genes
+  sampled_genes <- sample(remaining_genes, n_to_sample)
+  # Combine with genes_show and reorder if desired
+  final_genes <- c(genes_show, sampled_genes)
+  # Subset the correlation matrix
+  correlation_matrix <- correlation_matrix[final_genes, final_genes]
+}
+
+# Create annotation for selected genes
+row_anno <- rowAnnotation(
+  genes = anno_mark(
+    at = match(genes_show, rownames(correlation_matrix)),
+    labels = labels_show,
+    labels_gp = gpar(fontsize = 8),
+    link_width = unit(5, "mm")
+  )
+)
+
+# Create the heatmap
+pdf(file = paste0(result_figure_dir, "Heatmap_corplot_", modality, "_", timePt, ".pdf"), height = 6, width = 8) 
+p <- Heatmap(
+  correlation_matrix,
+  name = "Correlation",
+  col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_distance_columns = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_method_columns = "complete",
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  right_annotation = row_anno,
+  border = FALSE
+)
+print(p)
+dev.off()
+
+```
+
+# Extract genes from the big cluster that contains most reported proteins that cor with irAEs
+```{r}
+
+# Draw the heatmap and capture clustering
+ht_drawn <- draw(p)
+
+# Get row dendrogram and cut into k clusters
+row_dend <- row_dend(ht_drawn)
+row_clusters <- cutree(as.hclust(row_dend), k = 10)  # adjust k to isolate the desired cluster
+# Extract gene names from cluster 1 (e.g. the large upper-left cluster)
+genes_in_cluster1 <- names(row_clusters[row_clusters == 1])
+table(row_clusters)
+
+known_proteins <- c("CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10", "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19", "PGF") # "IL12A", "IL21", # 15
+sum(known_proteins %in% genes_in_cluster1)
+known_proteins[!(known_proteins %in% genes_in_cluster1)]
+
+
+genes_in_cluster1_pre <- genes_in_cluster1
+genes_in_cluster1_on <- genes_in_cluster1
+
+common_gene <- intersect(genes_in_cluster1_pre, genes_in_cluster1_on)
+
+######################## plot change of cluster 1 size and known gene coverage with K
+library(ComplexHeatmap)
+library(ggplot2)
+library(dplyr)
+
+# Your known proteins of interest
+known_proteins <- c("CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10",
+                    "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19", "PGF")
+
+# Get row dendrogram
+row_dend <- row_dend(ht_drawn)
+
+# Prepare results storage
+results_df <- data.frame(k = integer(), total_genes = integer(), known_genes = integer())
+
+# Loop over k values
+for (k in 8:20) {
+  row_clusters <- cutree(as.hclust(row_dend), k = k)
+  cluster1_genes <- names(row_clusters[row_clusters == 1])
+  
+  total_genes <- length(cluster1_genes)
+  known_in_cluster <- sum(known_proteins %in% cluster1_genes)
+  
+  results_df <- rbind(results_df, data.frame(
+    k = k,
+    total_genes = total_genes,
+    known_genes = known_in_cluster
+  ))
+}
+
+# Convert to long format for ggplot
+plot_df <- results_df %>%
+  pivot_longer(cols = c("total_genes", "known_genes"),
+               names_to = "Metric", values_to = "Count")
+
+# Plot
+ggplot(plot_df, aes(x = k, y = Count, color = Metric)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("total_genes" = "gray40", "known_genes" = "red"),
+                     labels = c("Total genes in Cluster 1", "Known proteins in Cluster 1")) +
+  labs(
+    x = "Number of clusters (k)",
+    y = "Gene count in Cluster 1",
+    color = NULL,
+    title = "Cluster 1 content vs. clustering resolution"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+# SFigure 5H (upper). Venn plot of overlaped genes between pre and on-treatment clustering
+```{r}
+# Install and load necessary package
+if (!requireNamespace("VennDiagram", quietly = TRUE)) {
+  install.packages("VennDiagram")
+}
+library(VennDiagram)
+
+# Create a Venn diagram
+venn.plot <- draw.pairwise.venn(
+  area1 = length(genes_in_cluster1_pre),
+  area2 = length(genes_in_cluster1_on),
+  cross.area = length(intersect(genes_in_cluster1_pre, genes_in_cluster1_on)),
+  category = c("Pre-treatment", "On-treatment"),
+  fill = c("skyblue", "pink1"),
+  lty = "blank",
+  cex = 2,
+  cat.cex = 2,
+  cat.pos = c(-20, 20)
+)
+
+fig_width = 5
+fig_height = 3
+pdf_file <- paste0(result_figure_dir, "venn_cluster1_pre_on_HCI002.pdf")
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+grid.draw(venn.plot)
+dev.off()
+
+```
+
+# SFigure 5H (lower). Test predictive power of irAE of the common 77 proteins and plot the AUC values with 95% CI. order by values
+```{r}
+
+phenotype_vec <- HCI002_all_info$IRAEactionable01
+feature_names <- colnames(HCI002_all_info)
+
+potential_predictors <- as.character(auc_results$Protein[auc_results$AUC > 0.6])
+
+OLINK_FC_ind <- (grepl("OID", feature_names) & grepl("FC_on_pre", feature_names))
+OLINK_FC_data <- as.matrix(HCI002_all_info[OLINK_FC_ind])
+colnames(OLINK_FC_data) <- gsub("_OLINK_FC_on_pre", "", colnames(OLINK_FC_data))
+mapped_names <- proteins_mapping[colnames(OLINK_FC_data)]
+# Handle unmapped IDs (optional, but recommended for robustness)
+mapped_names[is.na(mapped_names)] <- colnames(OLINK_FC_data)[is.na(mapped_names)]
+colnames(OLINK_FC_data) <- mapped_names
+OLINK_FC_data <- OLINK_FC_data[, !duplicated(colnames(OLINK_FC_data))]
+OLINK_FC_data_filtered <- OLINK_FC_data[, common_gene]
+OLINK_FC_data_filtered <- as.data.frame(scale(OLINK_FC_data_filtered))
+
+######################## plot the AUC values with 95% CI. order by values
+# Step 1: Compute AUCs and 95% CI
+auc_results <- data.frame(
+  Protein = character(),
+  AUC = numeric(),
+  CI_low = numeric(),
+  CI_high = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (protein in colnames(OLINK_FC_data_filtered)) {
+  predictor <- OLINK_FC_data_filtered[[protein]]
+  roc_obj <- roc(phenotype_vec, predictor, direction = "<", quiet = TRUE)
+  ci_vals <- ci.auc(roc_obj, conf.level = 0.95)
+
+  auc_results <- rbind(auc_results, data.frame(
+    Protein = protein,
+    AUC = as.numeric(auc(roc_obj)),
+    CI_low = ci_vals[1],
+    CI_high = ci_vals[3]
+  ))
+}
+
+# Step 2: Sort by AUC ascending and factor Protein accordingly
+auc_results <- auc_results %>%
+  arrange(AUC) %>%
+  mutate(Protein = factor(Protein, levels = Protein))  # keep sorted order
+
+# Step 3: Set fill color based on AUC threshold
+auc_results$FillColor <- ifelse(auc_results$AUC > 0.6, "#4CAF50", "white")  # green vs white
+
+# Step 4: Plot
+fig_width = 10
+fig_height = 3.2
+pdf_file <- paste0(result_figure_dir, "barplot_compare_AUCs_unsupervisedProteins_FC_HCI002.pdf")
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(auc_results, aes(x = Protein, y = AUC, fill = FillColor)) +
+  geom_bar(stat = "identity", color = "black") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  scale_fill_identity() +
+  ylab("AUC (with 95% CI)") +
+  xlab("") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text()
+  )
+dev.off()
+
+```
+
+# Figure 3F. cor. heatmap between CyTOF and OLINK (major cell types + activated CD8TCM, existing biomarker proteins), use baseline CyTOF vs Fold-change OLINK proteins
+```{r}
+
+major_celltypes <- c("T_CELL", "GDT", "B_CELL", "B_NAIVE", "B_MEM", "PB", "NK", "MONO", "DC", "NKT", "DPT", "DNT", "CD8_T", "CD8_TNAIVE", "CD8_TCM", "CD8_TEM", "CD8_TEMRA", "TREG", "CD4_TNAIVE", "CD4_TCM", "CD4_TEM" , "CD8_TCM > HLADR", "CD8_TCM > CD38", "CD8_TCM > KI67", "CD4_TEM > HLADR", "CD4_TEM > CD38", "CD4_TEM > KI67") 
+major_celltypes_show <- c("T", "gdT", "B", "Bnaive", "Bmemory", "Plasma", "NK", "Monocytes", "DC", "NKT", "DPT", "DNT", "CD8+ T", "CD8+ Tnaive", "CD8+ Tcm", "CD8+ Tem", "CD8+ Temra", "Tregs", "CD4+ Tnaive", "CD4+ Tcm", "CD4+ Tem", "HLADR+ CD8+ Tcm", "CD38+ CD8+ Tcm", "Ki67+ CD8+ Tcm", "HLADR+ CD4+ Tem", "CD38+ CD4+ Tem", "Ki67+ CD4+ Tem")
+CyTOF_baseline_data_subset <- CyTOF_baseline_data[, major_celltypes]
+
+OLINK_proteins_show <- c("CXCL9", "CXCL10", "CXCL11", "CXCL13", "IFNG", "IL2RB", "IL10", "IL12A", "IL17A", "IL21", "B4GALT1", "CD70", "CD276", "FLT3LG", "FSTL3",  "KRT19", "PGF")
+OLINK_proteins_show <- intersect(OLINK_proteins_show, colnames(OLINK_FC_data))
+OLINK_FC_data_subset <- OLINK_FC_data[, OLINK_proteins_show]
+
+# 1. Compute correlation and p-values
+cor_matrix <- matrix(NA, nrow = ncol(OLINK_FC_data_subset), ncol = ncol(CyTOF_baseline_data_subset))
+p_matrix <- matrix(NA, nrow = ncol(OLINK_FC_data_subset), ncol = ncol(CyTOF_baseline_data_subset))
+rownames(cor_matrix) <- colnames(OLINK_FC_data_subset)
+colnames(cor_matrix) <- major_celltypes_show
+rownames(p_matrix) <- rownames(cor_matrix)
+colnames(p_matrix) <- colnames(cor_matrix)
+
+# Fill correlation and p-value matrices
+for (i in seq_len(ncol(OLINK_FC_data_subset))) {
+  for (j in seq_len(ncol(CyTOF_baseline_data_subset))) {
+    test <- suppressWarnings(cor.test(
+      OLINK_FC_data_subset[, i],
+      CyTOF_baseline_data_subset[, j],
+      method = "spearman",
+      use = "pairwise.complete.obs"
+    ))
+    cor_matrix[i, j] <- test$estimate
+    p_matrix[i, j] <- test$p.value
+  }
+}
+
+# 2. Order columns by mean correlation
+col_means <- colMeans(cor_matrix, na.rm = TRUE)
+ordered_colnames <- names(sort(col_means))  # ascending
+cor_matrix <- cor_matrix[, ordered_colnames]
+p_matrix <- p_matrix[, ordered_colnames]
+
+# 3. Create heatmap with significance stars
+p <- Heatmap(
+  cor_matrix,
+  name = "Correlation",
+  col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_side = "left",
+  column_names_side = "bottom",
+  border = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(p_matrix[i, j]) && p_matrix[i, j] < 0.05) {
+      grid.text("*", x = x, y = y, gp = gpar(fontsize = 10))
+    }
+  }
+)
+pdf(file = paste0(result_figure_dir, "Heatmap_corplot_CyTOF_OLINK_predictors.pdf"), height = 6*0.7, width = 8*0.8) 
+print(p)
+dev.off()
+
+```
+

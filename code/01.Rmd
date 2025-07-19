@@ -1,0 +1,909 @@
+---
+title: "Overview of discovery and validation cohorts"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+```
+
+
+####### This script makes the below displays for the paper
+## Figure 1A-E
+## SFigure 1A-B
+
+# Package Loading
+```{r}
+# Install necessary packages
+if (!requireNamespace("flowCore", quietly = TRUE)) {
+  BiocManager::install("flowCore")
+}
+if (!requireNamespace("readxl", quietly = TRUE)) {
+  install.packages("readxl")
+}
+if (!requireNamespace("manipulate", quietly = TRUE)) {
+  install.packages("manipulate")
+}
+if (!requireNamespace("FlowSOM", quietly = TRUE)) {
+  BiocManager::install("FlowSOM")
+}
+
+library(devtools)
+library(flowCore)
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+
+library(shiny)
+library(umap)
+
+library(FlowSOM)
+library(ConsensusClusterPlus)
+library(pheatmap)
+library(dplyr)
+
+library(RColorBrewer)
+library(openxlsx)
+
+library(tibble) 
+library(tidyverse)
+library(tidyr)
+library(dendextend)
+
+library(survival)
+library(survminer)
+
+
+```
+
+# parameters, functions and constants
+```{r}
+
+file_prefix = "HCI001" 
+# Siwen: HCI001 HCI002_baseline HCI002_ontreat
+
+surface_markers <- c("CD45", "CD8", "HLADR", "CD66B", "CD57", "KLRG1", "CD3", "CD19", "CD69", "GZMB", "CD4", "CD11B", "CD11C", "CD14", "TIGIT", "CD86", "CD123", "TCRGD", "CD45RA", "TIM3", "CD33", "PDL1", "CCR7", "CD27", "CD39", "TBET", "CTLA4", "FOXP3", "CD28", "CD161", "CD127", "CD74", "CD25", "KI67", "ICOS", "LOX1", "CD15", "CD38", "IGG4", "PD1", "LAG3", "CD56", "CD16")
+length(surface_markers)
+
+# Define colors for UMAP clusters
+color_clusters <- c(
+  "#DC050C", "#FB8072", "#1965B0", "#7BAFDE", "#882E72",
+  "#B17BA6", "#FF7F00", "#FDB462", "#E7298A", "#E78AC3",
+  "#33A02C", "#B2DF8A", "#55A1B1", "#8DD3C7", "#A6761D",
+  "#E6AB02", "#7570B3", "#BEAED4", "#666666", "#999999",
+  "#aa8282", "#d4b7b7", "#8600bf", "#ba5ce3", "#808000",
+  "#aeae5c", "#1e90ff", "#00bfff", "#56ff0d", "#ffff00",
+  "#8B3800", "#4E8500", "#D70131", "#E64B35B2", "#4DBBD5B2",
+  "#00A087B2", "#3C5488B2", "#F39B7FB2", "#4E8500", "#4C00FFFF",
+  "#000DFFFF", "#0068FFFF", "#00C1FFFF", "#00FF24FF", "#42FF00FF",
+  "#A8FF00FF", "#FFF90CFF", "#FFE247FF", "#FFDB83FF", "#4a5b67",
+  "#91D1C2B2", "#DC0000B2", "#7E6148B2", "#B09C85B2", "#15b2d3",
+  "#236e96", "#ffd700", "#f3872f", "#ff598f", "#4B0082",
+  "#00FA9A", "#FFD700", "#9400D3", "#FF4500", "#DA70D6",
+  "#8B0000", "#5F9EA0", "#7FFF00", "#6495ED", "#DB7093",
+  "#FF6347", "#4682B4", "#FF1493", "#FFDAB9", "#ADFF2F",
+  "#006400", "#00CED1", "#800080", "#FF69B4", "#1E90FF",
+  "#B22222", "#8B4513", "#A52A2A", "#0000FF", "#00FF7F",
+  "#FFB6C1", "#32CD32", "#808080", "#D2691E", "#4169E1",
+  "#DAA520", "#FF4500", "#98FB98", "#CD5C5C", "#2F4F4F",
+  "#00008B", "#8A2BE2", "#CD853F", "#20B2AA", "#DC143C"
+)
+
+custom_colors = c("#1c4f27", "#81144e", "#79831e", "#00305d", "#C0C0C0", "#9c1915", "black", "#404040", "#808080", "#D3D3D3")
+
+```
+
+# load results from a completed FlowSOM analysis
+```{r}
+
+#### Load the data back when needed
+cytometry_data_loaded <- readRDS(paste0(data_dir, "processed_allInfo.rds"))
+#cytometry_data_loaded <- readRDS(paste0(data_dir, "processed_allInfo_ontreat.rds"))
+#cytometry_data_loaded <- readRDS(paste0(data_dir, "processed_allInfo_baseline.rds"))
+
+#### Access data from the loaded list
+data.shift <- cytometry_data_loaded$expression_data
+cell_clustering <- cytometry_data_loaded$clusters
+cell_types <- cytometry_data_loaded$cell_types
+Umap <- cytometry_data_loaded$umap
+sample_ids <- cytometry_data_loaded$sample_ids
+subsample_indices <- cytometry_data_loaded$subsample_indices
+
+cell_clustering_coarse <- cytometry_data_loaded$cell_clustering_coarse
+lineage_markers <- cytometry_data_loaded$lineage_markers
+fine_to_coarse_map <- cytometry_data_loaded$fine_to_coarse_map
+
+
+new_colnames = colnames(data.shift)
+
+rm(cytometry_data_loaded)
+gc()
+
+Umap0 <- Umap
+
+```
+
+# load cell types 
+```{r}
+
+expr_median_annotated <- read.xlsx(paste0(data_dir,file_prefix, "_cluster_annotation.xlsx"))
+#expr_median_annotated <- read.xlsx(paste0(data_dir,file_prefix, "_cluster_annotation_ontreat.xlsx"))
+#expr_median_annotated <- read.xlsx(paste0(data_dir,file_prefix, "_cluster_annotation_baseline.xlsx"))
+### Convert to tibble to ensure compatibility with dplyr functions
+rownames(expr_median_annotated) <- expr_median_annotated[, 1]
+expr_median_annotated <- expr_median_annotated[, -1]
+expr_median_annotated <- as_tibble(expr_median_annotated)
+
+### Create a mapping from cluster number to cell type
+cluster_to_celltype <- expr_median_annotated %>%
+  distinct(cell_clustering, cell_type) %>%   # Get unique combinations
+  deframe()  # Convert to named vector
+
+### Map each cluster number to the corresponding cell type
+cell_types <- cluster_to_celltype[as.character(cell_clustering)]
+print(as.character(cluster_to_celltype))
+sort(table(cell_types))
+
+```
+
+# Figure 1 A-B (middle): UMAP Visualization of cell types
+```{r}
+
+Umap <- Umap0
+remove_ind <- (cell_types[subsample_indices] %in% c("Other", "Basophils", "Neutrophils"))
+#Umap <- Umap[!remove_ind, ]
+
+subsample_indices_sub <- subsample_indices[!remove_ind]
+data_subsample <- data.shift[subsample_indices_sub, , drop = F]
+umap_model <- umap(data_subsample[,colnames(data_subsample) %in% surface_markers], random_state = 123, verbose = T)
+#umap_model <- umap(data_subsample, random_state = 123, verbose = T)
+Umap <- as.data.frame(umap_model$layout)
+colnames(Umap) <- c("Umap1", "Umap2")
+
+Umap$cell_type <- cell_types[subsample_indices_sub]
+Umap$cell_type[Umap$cell_type == "CD4T_EMRA"] <- "CD4T_EM"
+unique(Umap$cell_type)
+
+Umap$cell_type <- recode(Umap$cell_type,
+  CD4T_EM     = "CD4+ Tem",
+  CD4T_CM     = "CD4+ Tcm",
+  B           = "B",
+  CD8T_CM     = "CD8+ Tcm",
+  Tregs       = "Tregs",
+  CD8T_EMRA   = "CD8+ Temra",
+  CD8T_Naive  = "CD8+ Tnaive",
+  GDT         = "GDT",
+  Monocytes   = "Monocytes",
+  CD4T_Naive  = "CD4+ Tnaive",
+  NK          = "NK",
+  NKT         = "NKT",
+  CD8T_EM     = "CD8+ Tem",
+  cDC         = "cDC",
+  pDC         = "pDC",
+  DNT         = "DNT"
+)
+
+Umap <- Umap[sample(nrow(Umap), 10000), ]
+
+# Plot UMAP with cell types
+Umap_plot <- Umap#[Umap$cell_type != "Other", ]
+pdf(file = paste0(result_figure_dir, file_prefix, "_", "UMAP_CellTypes.pdf"),height = 10 * 0.4,width = 14 * 0.4)
+centroids <- Umap_plot %>%
+  group_by(cell_type) %>%
+  summarize(Umap1 = median(Umap1), Umap2 = median(Umap2))
+ggplot(Umap_plot, aes(x = Umap1, y = Umap2, color = cell_type)) + # , color = cluster
+  geom_point(size = 0.1) +
+  scale_color_manual(values = color_clusters) +
+  theme(panel.grid = element_blank(), 
+        legend.key.height = unit(0.8, "lines"),
+          panel.background = element_rect(fill = "white"),
+          axis.line.y = element_line(color="black"),
+          axis.line.x = element_line(color="black"),
+          axis.ticks.y = element_line(color="black"),
+          axis.ticks.x = element_line(color="black"),
+          axis.text.y = element_text(color="black"),
+          panel.border = element_blank(),  # Remove top and right border lines
+          #legend.position = "none",
+          axis.text.x = element_text(color="black") # , angle = 0, hjust = 1
+          )+ 
+  geom_text_repel(
+    data = centroids,
+    aes(x = Umap1, y = Umap2, label = cell_type),
+    color = "black"
+  ) +
+  labs(title = "", x = "UMAP1", y = "UMAP2") +
+  guides(color = guide_legend(ncol = 1, override.aes = list(size = 3), title = NULL))
+dev.off()
+
+
+```
+
+# Figure 1 A-B (right): dotplot of marker expression in cell type clusters
+```{r}
+
+raw_data_mat <- data.shift[subsample_indices, colnames(data.shift) %in% surface_markers]
+cell_types_sub <- cell_types[subsample_indices]
+
+keep_ind <- !(cell_types_sub %in% c("Other", "Basophils", "Neutrophils"))
+raw_data_mat <- raw_data_mat[keep_ind, ]
+cell_types_sub <- cell_types_sub[keep_ind]
+
+# 1. Rearranged markers (from general → lineage → subset → activation → state)
+ordered_markers <- c(
+  "CD45", "HLADR", "CD74",                             # General / APC
+  "CD3", "CD4", "CD8", "TCRGD", "CD19",                # T and B lineage
+  "CD11B", "CD11C", "CD14", "CD15", "CD123", "CD66B",  # Myeloid
+  "CD56", "CD16",                                      # NK
+  "CD45RA", "CCR7", "CD27", "CD28", "CD127", "CD95", "CD161",  # Subset markers
+  "CD69", "CD86", "ICOS", "PD1", "PDL1", "CTLA4", "LAG3", "TIGIT", "CD39", "CD25", "FOXP3",  # Activation/exhaustion
+  "GZMB", "TBET", "KLRG1", "CD57", "LOX1", "IGG4",      # Functional/cytotoxic
+  "KI67"                                               # Proliferation
+)
+
+ordered_markers <- ordered_markers[(ordered_markers %in% colnames(raw_data_mat))]
+
+# 2. Reorder raw_data_mat columns to match the new marker order
+raw_data_mat <- raw_data_mat[, ordered_markers]
+
+# 3. Define mapping: original marker → publication-friendly name
+marker_name_map <- c(
+  CD45    = "CD45",
+  HLADR   = "HLA-DR",
+  CD74    = "CD74",
+  CD3     = "CD3",
+  CD4     = "CD4",
+  CD8     = "CD8",
+  TCRGD   = "TCRgd",
+  CD19    = "CD19",
+  CD11B   = "CD11b",
+  CD11C   = "CD11c",
+  CD14    = "CD14",
+  CD15    = "CD15",
+  CD123   = "CD123",
+  CD66B   = "CD66b",
+  CD56    = "CD56",
+  CD16    = "CD16",
+  CD45RA  = "CD45RA",
+  CCR7    = "CCR7",
+  CD27    = "CD27",
+  CD28    = "CD28",
+  CD127   = "CD127",
+  CD95    = "CD95",
+  CD161   = "CD161",
+  CD69    = "CD69",
+  CD86    = "CD86",
+  ICOS    = "ICOS",
+  PD1     = "PD-1",
+  PDL1    = "PD-L1",
+  CTLA4   = "CTLA-4",
+  LAG3    = "LAG-3",
+  TIGIT   = "TIGIT",
+  CD39    = "CD39",
+  CD25    = "CD25",
+  FOXP3   = "FOXP3",
+  GZMB    = "Granzyme B",
+  TBET    = "T-bet",
+  KLRG1   = "KLRG1",
+  CD57    = "CD57",
+  LOX1    = "LOX-1",
+  IGG4    = "IgG4",
+  KI67    = "Ki-67"
+)
+
+# 4. Rename columns using the mapping
+colnames(raw_data_mat) <- marker_name_map[colnames(raw_data_mat)]
+
+# Step 1: Aggregate marker expression by cell type (mean expression per marker)
+agg_data <- as.data.frame(raw_data_mat) %>%
+  mutate(cell_type = cell_types_sub) %>%
+  group_by(cell_type) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  as.data.frame()
+
+# Step 2: Set cell type as rownames and remove column
+rownames(agg_data) <- agg_data$cell_type
+agg_data$cell_type <- NULL
+
+# Step 3: Scale data if needed (optional)
+scaled_data <- scale(agg_data)
+
+cell_type_order <- c(
+  "CD4+ Tnaive", "CD4+ Tcm", "CD4+ Tem", "Tregs",
+  "CD8+ Tnaive", "CD8+ Tcm", "CD8+ Tem", "CD8+ Temra",
+  "NKT", "GDT", "DNT","NK", "B", 
+  "Monocytes", "cDC", "pDC"
+)
+rowname_map <- c(
+  CD4T_Naive  = "CD4+ Tnaive",
+  CD4T_CM     = "CD4+ Tcm",
+  CD4T_EM     = "CD4+ Tem",
+  Tregs       = "Tregs",
+  CD8T_Naive  = "CD8+ Tnaive",
+  CD8T_CM     = "CD8+ Tcm",
+  CD8T_EM     = "CD8+ Tem",
+  CD8T_EMRA   = "CD8+ Temra",
+  NKT         = "NKT",
+  GDT         = "GDT",
+  DNT         = "DNT",
+  B           = "B",
+  NK          = "NK",
+  Monocytes   = "Monocytes",
+  cDC         = "cDC",
+  pDC         = "pDC"
+)
+rownames(scaled_data) <- rowname_map[rownames(scaled_data)]
+scaled_data <- scaled_data[cell_type_order, , drop = FALSE]
+
+# Step 4: Generate heatmap
+pdf(file = paste0(result_figure_dir, file_prefix, "_", "heatmap_CellTypes.pdf"),height = 8 * 0.4,width = 14 * 0.4)
+pheatmap(scaled_data,
+         cluster_rows = F,
+         cluster_cols = F,
+         fontsize_row = 9,
+         fontsize_col = 9,
+         main = "")
+dev.off()
+
+```
+
+################################## Figure 1 C-E  ##################################
+
+# load data
+```{r}
+
+### load HCI002 data
+HCI002_all_info0 <- read_csv(file = paste0(data_dir, "HCI002_all_info_20241008.csv"), name_repair = "minimal") 
+HCI002_map_df = read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+
+### load HCI001 data
+HCI001_all_info0 <- read_csv(file = paste0(data_dir, "HCI001_flow_olink_all_info_flat_20241008.csv"), name_repair = "minimal") 
+HCI001_map_df = read.csv(file = paste0(data_dir, "OlinkID_ProteinName_map.csv"))
+
+```
+
+#  how many samples in HCI002 and HCI001? (for Figure 1A-B)
+```{r}
+
+######## HCI001
+samples_me <- HCI001_all_info0$`RedCap ID`
+# Remove everything after the first underscore (if present)
+samples_cleaned <- sub("_.*", "", samples_me)
+length(unique(samples_cleaned))
+HCI001_all_info0$patient_therapy <- paste(samples_cleaned, HCI001_all_info0$`Current Therapy`, HCI001_all_info0$`Type of therapy`, sep = "_")
+# Count unique patient IDs
+num_unique_patients <- length(unique(HCI001_all_info0$patient_therapy))
+# Print result
+num_unique_patients
+
+df_test <- data.frame(x0 = HCI001_all_info0$patient_therapy,
+                      x1 = HCI001_all_info0$`CD4_nonTREG > CD38_Baseline`,
+                      x2 = HCI001_all_info0$OID21336_OLINK_baseline,
+                      x3 = HCI001_all_info0$`CD4_nonTREG > CD38_irAEmax`,
+                      x4 = HCI001_all_info0$OID21336_OLINK_irAEmax)
+df_test <- df_test[rowSums(is.na(df_test)) < 4, ]
+dim(df_test)
+HCI001_uniqueSamples <- unique(df_test$x0)
+length(HCI001_uniqueSamples)
+sum(!is.na(df_test$x1))
+sum(!is.na(df_test$x2))
+sum(!is.na(df_test$x3))
+sum(!is.na(df_test$x4))
+
+
+######## HCI002
+samples_me <- length(unique(HCI002_all_info0$patient_therapy))
+samples_me
+
+num_unique_patients <- length(unique(HCI002_all_info0$`Record ID`))
+num_unique_patients
+
+df_test <- data.frame(x0 = HCI002_all_info0$patient_therapy,
+                      x1 = HCI002_all_info0$CD4_nonTREG_FC_baselineL2,
+                      x2 = HCI002_all_info0$OID21336_OLINK_baseline,
+                      x3 = HCI002_all_info0$CD4_nonTREG_FC_ontreatL2,
+                      x4 = HCI002_all_info0$OID21336_OLINK_ontreat)
+df_test <- df_test[rowSums(is.na(df_test)) < 4, ]
+dim(df_test)
+HCI002_uniqueSamples <- unique(df_test$x0)
+length(HCI002_uniqueSamples)
+sum(!is.na(df_test$x1))
+sum(!is.na(df_test$x2))
+sum(!is.na(df_test$x3))
+sum(!is.na(df_test$x4))
+
+```
+
+# Figure 1C-D: load data for statistical plots 
+```{r}
+
+all_info <- HCI002_all_info0[HCI002_all_info0$patient_therapy %in% HCI002_uniqueSamples, 1:59]
+all_info <- all_info[!duplicated(all_info$patient_therapy), ]
+
+```
+
+# pie plots R vs NR, Severe vs non-severe irAE, ICB experienced vs naive, PD1/L1 vs CTLA4-containing, stages, sex etc
+```{r}
+## R vs NR
+table(all_info$Response01)
+mean(all_info$Response01, na.rm=T)
+data <- data.frame(
+  Category = c("Benefit (n = 86)", "No benefit (n = 71)"),
+  Count = c(86, 71)
+)
+
+## Severe vs non-severe irAE
+table(all_info$IRAEactionable01)
+mean(all_info$IRAEactionable01, na.rm=T)
+data <- data.frame(
+  Category = c("Severe-irAE (n = 55)", "Non-severe-irAE (n = 102)"),
+  Count = c(55,102)
+)
+
+## ICB experienced vs naive
+table(all_info$`ICI Naïve?`)
+data <- data.frame(
+  Category = c("ICB naive (n = 97)", "ICB experienced (n = 62)"),
+  Count = c(97,62)
+)
+
+## PD1/L1 vs CTLA4-containing
+all_info$Drug = "PD1/PDL1"
+all_info$Drug[all_info$`Systemic Therapy Name` %in% c("Nivolumab/ Ipilimumab", "PD1-CTLA4 bispecific", "Ipi 10 / temozolomide", "Nivolumab/ Ipilimumab flipped dose", "Ipi 3 / temozolomide", "Pembrolizumab / CTLA-4-LAG3 bispecific", "CTLA-4-LAG3 bispecific", "Pembrolizumab/ anti-CTLA4", "anti-CTLA4")] = "CTLA4-containing"
+table(all_info$Drug)
+data <- data.frame(
+  Category = c("anti-PD1/PDL1 (n = 118)", "anti-CTLA4-containing (n = 41)"),
+  Count = c(118,41)
+)
+
+## stages
+all_info$Stage <- all_info$`Baseline Stage / TNM`
+all_info$Stage[grepl("Stage I", all_info$`Baseline Stage / TNM`)] <- "Stage I"
+all_info$Stage[grepl("Stage IV", all_info$`Baseline Stage / TNM`)] <- "Stage IV"
+all_info$Stage[grepl("Stage II", all_info$`Baseline Stage / TNM`)] <- "Stage II"
+all_info$Stage[grepl("Stage III", all_info$`Baseline Stage / TNM`)] <- "Stage III"
+table(all_info$Stage)
+data <- data.frame(
+  Category = c("Stage II (n = 5)", "Stage III (n = 66)", "Stage IV (n = 88)"),
+  Count = c(5,66,88)
+)
+
+## sex
+table(all_info$Gender)
+data <- data.frame(
+  Category = c("Female (n = 63)", "Male (n = 96)"),
+  Count = c(63,96)
+)
+
+data$Category = factor(data$Category, levels = data$Category)
+
+# Create the pie chart
+height_big = 2*0.4*3
+width_big = 2*0.6*3
+height_small = 2*0.6*3*0.6
+width_small = 2*0.5*3*0.4
+height_right = 2*0.5*3
+width_right = 2*0.6*3
+
+pdf(file = paste0(result_figure_dir, "Figure1_piePlot.pdf"), 
+      height = height_big , width = width_big)
+ggplot(data, aes(x = "", y = Count, fill = Category)) +
+  geom_bar(stat = "identity", width = 1) +  # Create a bar plot
+  coord_polar(theta = "y") +  # Convert to pie chart
+  scale_fill_manual(values = custom_colors) +  # Use custom colors
+  theme_void() +  # Remove background and axes for a clean pie chart
+  theme(legend.position = "right"  # bottom right
+        ) + 
+  guides(fill = guide_legend(ncol = 1, byrow = F)) +  # Arrange legend in two columns
+  labs(title = "", fill = "")  # Add title and legend label
+dev.off()
+```
+
+# barplot of severe irAE types
+```{r}
+IRAE_all <- mean(all_info$IRAEactionable01, na.rm = T)
+IRAE_GI <- mean(all_info$IRAE_GI01, na.rm = T)
+IRAE_HB <- mean(all_info$IRAE_HB01, na.rm = T)
+IRAE_skin <- mean(all_info$IRAE_skin01, na.rm = T)
+IRAE_MSK <- mean(all_info$IRAE_MSK01, na.rm = T)
+IRAE_other_ind <- (!is.na(all_info$IRAEactionable01)) & (all_info$IRAEactionable01 == 1) & (is.na(all_info$IRAE_GI01) | (all_info$IRAE_GI01 == 0)) & (is.na(all_info$IRAE_HB01) | (all_info$IRAE_HB01 == 0)) & (is.na(all_info$IRAE_skin01) | (all_info$IRAE_skin01 == 0)) & (is.na(all_info$IRAE_MSK01) | (all_info$IRAE_MSK01 == 0))
+all_info$IRAE_other01[IRAE_other_ind] <- 1
+all_info$IRAE_other01[!IRAE_other_ind] <- 0
+all_info$IRAE_other01[is.na(all_info$IRAEactionable01)] <- NA
+IRAE_other <- mean(all_info$IRAE_other01, na.rm = T)
+
+plot_df <- data.frame(#Overall = IRAE_all,
+                      Gastrointestinal = IRAE_GI,
+                      Hepatobiliary = IRAE_HB,
+                      Musculoskeletal = IRAE_MSK,
+                      Skin = IRAE_skin,
+                      Other = IRAE_other)
+plot_df <- data.frame(t(plot_df))
+colnames(plot_df) <- "phenotype"
+plot_df$group <- rownames(plot_df)
+plot_df$group <- factor(plot_df$group, levels = rownames(plot_df))
+plot_df$phenotype <- plot_df$phenotype * 100
+
+# Create the plot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_severe_irAE_subtype_ratio.pdf"))
+fig_width <- 1.5
+fig_height <- 2.5
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(plot_df, aes(x = group, y = phenotype, fill = group)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +  # Barplot
+  labs(x = NULL, y = "Severe-irAE rate (%)", title = "") +
+  ylim(0, 10) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  )
+dev.off()
+```
+
+# box plots of age, TMB
+```{r}
+
+plot_df <- data.frame(
+                      Age = all_info$`Age at C1`,
+                      TMB = all_info$`TMB (mutation /mb)`,
+                      #`PDL1 CPS` = all_info$`PD-L1 CPS`,
+                      #`PDL1 TPS` = all_info$`PD-L1 TPS`,
+                      check.names = F)
+# Reshape to long format
+plot_long <- plot_df %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>%
+  filter(!is.na(Value))
+plot_long$Variable <- factor(plot_long$Variable, levels = colnames(plot_df))
+
+# boxplot + dotplot
+pdf_file <- paste0(result_figure_dir,paste0("boxplot_age_TMB_PDL1.pdf"))
+fig_width <- 1.2
+fig_height <- 2.5
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(plot_long, aes(x = Variable, y = Value)) +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.8, color = "grey") +
+  geom_boxplot(width = 0.2, outlier.shape = NA, fill = NA, color = "black") +
+  labs(title = "",
+       x = "", y = "Value") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  )
+dev.off()
+
+```
+
+# barplot of sex / ICBR / PDL1 vs irAE severity ratio (%)
+```{r}
+
+plot_df0 <- data.frame(
+                      PDL1 = all_info$`PD-L1 CPS`,
+                      Benefit = all_info$Response01,
+                      Sex = all_info$Gender,
+                      irAE = all_info$IRAEactionable01,
+                      check.names = F)
+
+
+################ PDL1 ################ 
+plot_df <- na.omit(plot_df0[c("PDL1", "irAE")])
+plot_df <- na.omit(plot_df)
+
+# Compute sIRAE proportion by PDL1 group
+plot_df$PDL1 <- ifelse(plot_df$PDL1 < 1, "PDL1 CPS-", "PDL1 CPS+")
+plot_df$PDL1 <- factor(plot_df$PDL1, levels = c("PDL1 CPS-", "PDL1 CPS+"))
+ratio_df <- plot_df %>%
+  group_by(PDL1) %>%
+  summarise(irAE_Ratio = mean(irAE))
+
+# Plot barplot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_PDL1_vs_irAE.pdf"))
+fig_width <- 1.1
+fig_height <- 2.5
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(ratio_df, aes(x = PDL1, y = irAE_Ratio, fill = PDL1)) +
+  geom_bar(stat = "identity", width = 0.6, alpha = 0.8, color = "black") +
+  scale_y_continuous(labels = function(x) x * 100, limits = c(0, 1))+
+  labs(title = "",
+       x = "",
+       y = "Severe-irAE rate (%)") +
+  ylim(c(0,0.5))+
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  )
+dev.off()
+
+# test significance with chi-square test
+table_irAE <- table(plot_df$PDL1, plot_df$irAE)
+print(table_irAE)
+chisq_test_result <- chisq.test(table_irAE)
+print(chisq_test_result)
+
+################ Clinical Benefit ################ 
+plot_df <- na.omit(plot_df0[c("Benefit", "irAE")])
+plot_df <- na.omit(plot_df)
+
+# Compute sIRAE proportion by PDL1 group
+plot_df$PDL1 <- ifelse(plot_df$Benefit < 1, "  No benefit", "Benefit")
+plot_df$PDL1 <- factor(plot_df$PDL1, levels = c("  No benefit", "Benefit"))
+ratio_df <- plot_df %>%
+  group_by(PDL1) %>%
+  summarise(irAE_Ratio = mean(irAE))
+
+# Plot barplot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_Benefit_vs_irAE.pdf"))
+fig_width <- 1.1
+fig_height <- 2.5
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(ratio_df, aes(x = PDL1, y = irAE_Ratio, fill = PDL1)) +
+  geom_bar(stat = "identity", width = 0.6, alpha = 0.8, color = "black") +
+  scale_y_continuous(labels = function(x) x * 100, limits = c(0, 1))+
+  labs(title = "",
+       x = "",
+       y = "Severe-irAE rate (%)") +
+  ylim(c(0,0.5))+
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  )
+dev.off()
+
+# test significance with chi-square test
+table_irAE <- table(plot_df$PDL1, plot_df$irAE)
+print(table_irAE)
+chisq_test_result <- chisq.test(table_irAE)
+print(chisq_test_result)
+
+
+
+################ Sex ################ 
+plot_df <- na.omit(plot_df0[c("Sex", "irAE")])
+plot_df <- na.omit(plot_df)
+
+# Compute sIRAE proportion by PDL1 group
+plot_df$PDL1 <- ifelse(plot_df$Sex == "Male", "Male", "       Female")
+plot_df$PDL1 <- factor(plot_df$PDL1, levels = c("Male", "       Female"))
+ratio_df <- plot_df %>%
+  group_by(PDL1) %>%
+  summarise(irAE_Ratio = mean(irAE))
+
+# Plot barplot
+pdf_file <- paste0(result_figure_dir,paste0("barplot_Sex_vs_irAE.pdf"))
+fig_width <- 1.1
+fig_height <- 2.5
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(ratio_df, aes(x = PDL1, y = irAE_Ratio, fill = PDL1)) +
+  geom_bar(stat = "identity", width = 0.6, alpha = 0.8, color = "black") +
+  scale_y_continuous(labels = function(x) x * 100, limits = c(0, 1))+
+  labs(title = "",
+       x = "",
+       y = "Severe-irAE rate (%)") +
+  ylim(c(0,0.5))+
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  )
+dev.off()
+
+# test significance with chi-square test
+table_irAE <- table(plot_df$PDL1, plot_df$irAE)
+print(table_irAE)
+chisq_test_result <- chisq.test(table_irAE)
+print(chisq_test_result)
+
+
+```
+
+# boxplot of age/TMB distribution vs irAE severity
+```{r}
+
+plot_df <- data.frame(
+                      #Age = all_info$`Age at C1`,
+                      Age = all_info$`TMB (mutation /mb)`,
+                      irAE = all_info$IRAEactionable01,
+                      check.names = F)
+plot_df <- na.omit(plot_df)
+plot_df$irAE <- ifelse(plot_df$irAE==1, "Severe irAE", "Non-severe irAE")
+plot_df$irAE <- factor(plot_df$irAE, levels = c("Non-severe irAE", "Severe irAE"))
+
+# boxplot + dotplot
+pdf_file <- paste0(result_figure_dir,paste0("boxplot_age_vs_irAE.pdf"))
+fig_width <- 1.2
+fig_height <- 2.5
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(plot_df, aes(x = irAE, y = Age, fill = irAE)) +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.8, color = "grey") +
+  geom_boxplot(width = 0.2, outlier.shape = NA, fill = NA, color = "black") +
+  labs(title = "",
+       x = "", y = "TMB (mut. / Mb)") + # Age (years) TMB (mut. / Mb)
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.line.y = element_line(color = "black"),
+    axis.line.x = element_line(color = "black"),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+    legend.position = "none",
+    panel.border = element_blank() # Remove top and right border lines
+  )
+dev.off()
+
+wilcox.test(plot_df$Age[plot_df$irAE == "Non-severe irAE"], plot_df$Age[plot_df$irAE == "Severe irAE"])
+
+```
+
+# Figure 1E/SFigure 1A-B: K-M survival curve of (severe irAE-free, OS, PFS) HCI002 (grouped by irAE or clinical benefit groups)
+```{r}
+
+## load survival information
+survival_info_df0 <- read_excel(data_dir, "HCI002 Teiko clinical info 7.12.23_clean_newest.xlsx")
+survival_info_df0 <- survival_info_df0[c("Vial ID", "Record ID", "Systemic Therapy Name", "Systemic Therapy Type", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event", "irAE Overall - Actionable", "Best/ Worst Response")]
+survival_info_df0$uniqueID <- paste0(survival_info_df0$`Record ID`, "_", survival_info_df0$`Systemic Therapy Name`, "_", survival_info_df0$`Systemic Therapy Type`)
+
+survival_info_df0 <- survival_info_df0[survival_info_df0$uniqueID %in% HCI002_uniqueSamples, ]
+survival_info_df0 <- survival_info_df0[!duplicated(survival_info_df0$uniqueID), ]
+
+survival_info_df0$IRAEactionable01 = -1000
+survival_info_df0$IRAEactionable01[survival_info_df0$`irAE Overall - Actionable` %in% c("Severe")] = 1 
+survival_info_df0$IRAEactionable01[survival_info_df0$`irAE Overall - Actionable` %in% c("Mild","Moderate","None")] = 0
+survival_info_df0$IRAEactionable01[survival_info_df0$`irAE Overall - Actionable` %in% c("NA","Exclude")] = NA
+
+survival_info_df0$Response01 = -1000
+survival_info_df0$Response01[survival_info_df0$`Best/ Worst Response` %in% c("CR", "PR", "NED")] = 1
+survival_info_df0$Response01[survival_info_df0$`Best/ Worst Response` %in% c("SD", "PD")] = 0
+survival_info_df0$Response01[survival_info_df0$`Best/ Worst Response` %in% c("NA")] = NA
+
+## convert days to months
+survival_info_df0$OS_time <- survival_info_df0$OS_time / 30
+survival_info_df0$PFS_time <- survival_info_df0$PFS_time / 30
+survival_info_df0$Nonsevere_irAE_time <- survival_info_df0$Nonsevere_irAE_time / 30
+
+############# Survival test for OS / PFS / time-irAEmax
+therapy_type_vec <- c("active", "All", "adjuvant", "neoadjuvant")
+phenotype_str_vec <- c("OS", "PFS", "Nonsevere_irAE")
+
+for(therapy_type in therapy_type_vec){
+  for (phenotype_str in phenotype_str_vec){
+    if (phenotype_str == "OS"){
+      y_label_str <- "Overall \nsurvival probability"  
+    }else if (phenotype_str == "PFS"){
+      y_label_str <- "Progression-free \nsurvival probability"
+    }else if (phenotype_str == "Nonsevere_irAE"){
+      y_label_str <- "Severe-irAE-free \nsurvival probability"
+    }
+    group_var <- "Response01" 
+    if (group_var == "IRAEactionable01"){
+      groups_name <- c("Severe-irAE", "Non-severe-irAE")
+    }else{
+      groups_name <- c("Benefit", "No benefit")
+    }
+    
+    if (therapy_type == "active"){
+      survival_info_df <- survival_info_df0[survival_info_df0$`Systemic Therapy Type` == "active treatment", ]
+    }else if (therapy_type == "adjuvant"){
+      survival_info_df <- survival_info_df0[survival_info_df0$`Systemic Therapy Type` == "adjuvant", ]
+    }else if (therapy_type == "neoadjuvant"){
+      survival_info_df <- survival_info_df0[survival_info_df0$`Systemic Therapy Type` == "neoadjuvant", ]
+    }else if (therapy_type == "All"){
+      survival_info_df <- survival_info_df0
+    }
+    
+    Score <- survival_info_df[[group_var]]
+    Score[survival_info_df[[group_var]] > 0.5] <- groups_name[1]
+    Score[survival_info_df[[group_var]] <= 0.5] <- groups_name[2]
+    cancerData=data.frame(Score,survival_info_df[[paste0(phenotype_str, "_time")]],survival_info_df[[paste0(phenotype_str, "_event")]])
+    colnames(cancerData) = c("Score","OS_time","OS_event")
+    cancerData <- na.omit(cancerData)
+    cancerData$Score <- factor(cancerData$Score)
+    cancerData$Score <- relevel(cancerData$Score, ref = groups_name[2])
+    
+    sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+    scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+    scox_coef = summary(scox)$coefficients
+    HR_value = scox_coef[2] # hazard ratio
+    Z_value=scox_coef[4]
+    P_value=scox_coef[5]
+    HR_CI = summary(scox)$conf.int[3:4]
+    
+    print(paste(HR_value, P_value))
+    
+    
+    ##### plot
+    fontSize = 12
+    survp=ggsurvplot(
+      sfit,
+      data = cancerData,
+      size = 1,                 # change line size
+      palette =
+        c("#00305d", "#9c1915"),# custom color palettes
+      conf.int = FALSE,          # Add confidence interval
+      pval = FALSE,              # Add p-value
+      #pval.coord = c(70*0.65, 0.55),
+      xlim = c(-3,70),
+      ylim=c(0,1),
+      xlab = "Time (months)", ylab= y_label_str,# 
+      break.time.by = 10,
+      risk.table=TRUE,
+      risk.table.height = 0.25, # Useful to change when you have multiple groups
+      risk.table.pos="out",
+      risk.table.col="black",
+      risk.table.y.text = FALSE,
+      tables.y.text = FALSE, 
+      tables.theme = theme_cleantable(),
+      legend.labs =c(groups_name[2], groups_name[1]),    # 
+      legend.title="",
+      legend = c(0.65, 0.975), # legend relative position
+      font.main = c(fontSize),
+      font.caption = c(fontSize),
+      font.legend = c(fontSize),
+      font.tickslab = c(fontSize),
+      font.x = c(fontSize),
+      font.y = c(fontSize),
+      ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                     plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                     panel.background = element_rect(fill = "white"),
+                     panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                     panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                     axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+    ) # + guides(colour = guide_legend(nrow = 1)) # legend in rows
+    
+    survp$plot = survp$plot+ 
+                ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+    pdf(paste0(result_figure_dir, "KM_curve_",therapy_type,"_",phenotype_str,"_vs_",groups_name,".pdf"),width=3.3, height=3)
+    print(survp, newpage = FALSE)
+    dev.off()
+  }
+}
+
+```
+

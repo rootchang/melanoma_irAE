@@ -1,0 +1,658 @@
+---
+title: "Predicting irAE with Olink serum proteins"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+####### This script makes the below displays for the paper
+## Figure 4D-F
+
+```{r setup, include=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+```
+
+# load required package
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(viridis)
+library(tidyr)
+library(pROC)
+library(verification)
+library(reshape2)
+library(ggpubr)
+
+library(dplyr)
+library(survival)
+library(survminer)
+
+
+library(glmnet)
+library(caret)
+library(pROC)
+library(ranger)
+library(readr)
+
+library(AnnotationDbi)
+library(org.Hs.eg.db) 
+library(ReactomePA)
+library(enrichplot)
+library(gridExtra)
+library(clusterProfiler)
+library(msigdbr)
+
+library(stringr)
+
+```
+
+
+# parameters and constants and common functions
+```{r}
+
+my.cols <- c("#1c4f27", "#81144e", "#79831e", "#00305d", "#9c1915", "black", "grey", "#f58231", "#e6194b", "#3cb44b", "#42d4f4") 
+
+# function mapping gene IDs and Symbols
+convert_gene_ids_to_symbols <- function(gene_ids, mapping) {
+  lapply(gene_ids, function(x) {
+    entrez_ids <- unlist(strsplit(x, "/"))
+    gene_symbols <- names(mapping)[match(entrez_ids, mapping)]
+    paste(gene_symbols, collapse = ", ")
+  })
+}
+
+# Create a function to make olink gene names unique
+make_unique <- function(names) {
+  # Initialize an empty vector to store unique names
+  unique_names <- character(length(names))
+  # Create a named vector to count occurrences
+  name_count <- table(names)
+  # Track the current count of each name
+  name_tracker <- setNames(rep(0, length(name_count)), names(name_count))
+  # Iterate over the names and create unique ones
+  for (i in seq_along(names)) {
+    name <- names[i]
+    # If this name is duplicated, append the appropriate number
+    if (name_tracker[name] > 0) {
+      new_name <- paste0(name, "_", name_tracker[name] + 1)
+    } else {
+      new_name <- name
+    }
+    # Assign the unique name
+    unique_names[i] <- new_name
+    # Increment the tracker for this name
+    name_tracker[name] <- name_tracker[name] + 1
+  }
+  return(unique_names)
+}
+
+```
+
+# Figure 4D. AUC comparison of CXCL9, CA6 in HCI002 at different time points
+```{r}
+
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+
+proteins_test <- c("CXCL9", "CA6", "CXCL10")
+proteins_test_OID <- HCI002_map_df$OlinkID[HCI002_map_df$Assay %in% proteins_test]
+
+joined_string <- paste(proteins_test_OID, collapse = "|")
+HCI002_feature_df <- HCI002_all_info0[grepl(joined_string, colnames(HCI002_all_info0))]
+time_pts <- c("baseline", "ontreat", "FC_on_pre")
+joined_string <- paste(time_pts, collapse = "|")
+HCI002_feature_df <- HCI002_feature_df[grepl(joined_string, colnames(HCI002_feature_df))]
+colnames(HCI002_feature_df) <- gsub("_OLINK", "", colnames(HCI002_feature_df))
+# Replace OlinkID substrings with gene symbols
+for (oid in names(proteins_mapping)) {
+  gene <- proteins_mapping[[oid]]
+  colnames(HCI002_feature_df) <- gsub(oid, gene, colnames(HCI002_feature_df))
+}
+
+HCI002_feature_df$CXCL9_CA6_baseline <- HCI002_feature_df$CXCL9_baseline - HCI002_feature_df$CA6_baseline
+HCI002_feature_df$CXCL9_CA6_ontreat <- HCI002_feature_df$CXCL9_ontreat - HCI002_feature_df$CA6_ontreat
+HCI002_feature_df$CXCL9_CA6_FC_on_pre <- HCI002_feature_df$CXCL9_FC_on_pre - HCI002_feature_df$CA6_FC_on_pre
+
+phenotype_name = "IRAEactionable01" # IRAEactionable01: column 55;  Response01: column 51
+phenotype_df = HCI002_all_info0[,phenotype_name, drop = F]
+HCI002_filtered_info = cbind(HCI002_feature_df, phenotype_df)
+
+
+####### calculate AUCs of CXCL9/CA6 in HCI002 at different time points
+# Separate predictors and phenotype
+predictor_df <- HCI002_filtered_info[ , -ncol(HCI002_filtered_info)]
+phenotype <- HCI002_filtered_info[[ncol(HCI002_filtered_info)]]
+
+# Prepare result storage
+result_df <- data.frame(
+  Feature = character(),
+  AUC = numeric(),
+  AUC_low = numeric(),
+  AUC_up = numeric(),
+  P_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each predictor column
+for (feature_name in colnames(predictor_df)) {
+  values <- predictor_df[[feature_name]]
+  
+  # Keep only non-NA pairs
+  valid_idx <- !is.na(values) & !is.na(phenotype)
+  if (sum(valid_idx) < 3 || length(unique(phenotype[valid_idx])) < 2) {
+    next  # skip if not enough data or classes
+  }
+  
+  values_valid <- values[valid_idx]
+  pheno_valid <- phenotype[valid_idx]
+  
+  # Compute AUC
+  roc_result <- roc(pheno_valid, values_valid, direction = "<", levels = c(0, 1), quiet = TRUE)
+  AUC_ci <- ci.auc(roc_result)
+  auc_val <- AUC_ci[2]
+  auc_low_val <- AUC_ci[1]
+  auc_up_val <- AUC_ci[3]
+  
+  # Compute p-value vs random (0.5)
+  suppressMessages({
+    roc_test <- roc.test(
+      roc_result,
+      roc(pheno_valid, rep(0.5, length(pheno_valid)), quiet = TRUE),
+      method = "delong"
+    )
+  })
+  auc_pval <- roc_test$p.value
+  
+  # Store result
+  result_df <- rbind(result_df, data.frame(
+    Feature = feature_name,
+    AUC = auc_val,
+    AUC_low = auc_low_val,
+    AUC_up = auc_up_val,
+    P_value = auc_pval
+  ))
+}
+print(result_df)
+
+result_df <- result_df[!grepl("CXCL9_CA6", result_df$Feature), ]
+
+####### barplot AUCs of CXCL9/CA6 in HCI002 at different time points
+# Extract protein and timepoint from Feature
+plot_df <- result_df %>%
+  mutate(
+    Protein = case_when(
+      grepl("CXCL9_CA6", Feature) ~ "CXCL9 - CA6",
+      grepl("CXCL9", Feature) ~ "CXCL9",
+      grepl("CA6", Feature) ~ "CA6"
+    ),
+    Timepoint = case_when(
+      grepl("baseline", Feature) ~ "Pre-treatment",
+      grepl("ontreat", Feature) ~ "On-treatment",
+      grepl("FC_on_pre", Feature) ~ "Fold-change",
+      TRUE ~ "unknown"
+    ),
+    irAE_pval_str = sapply(P_value, function(p) {
+      if (p == 0) return("p==0")
+      exp10  <- floor(log10(p))
+      coef   <- signif(p / 10^exp10, 2)
+      sprintf("p==%s%%*%%10^%s", coef, exp10)
+    })
+  )
+
+# Identify rows where AUC < 0.5
+idx <- plot_df$AUC < 0.5
+
+# Apply 1 - x to all three columns for those rows
+plot_df$AUC[idx] <- 1 - plot_df$AUC[idx]
+plot_df$AUC_low[idx] <- 1 - plot_df$AUC_low[idx]
+plot_df$AUC_up[idx] <- 1 - plot_df$AUC_up[idx]
+
+# Set factor levels to control bar order
+plot_df$Timepoint <- factor(plot_df$Timepoint, levels = c("Pre-treatment", "On-treatment", "Fold-change"))
+plot_df$Protein <- factor(plot_df$Protein, levels = c("CXCL9", "CA6", "CXCL9 - CA6"))
+
+# Define custom colors
+custom_colors <- c(
+  "CXCL9"      = "#1B9E77",  # Teal-green
+  "CA6"        = "#D95F02",  # Warm orange
+  "CXCL9 - CA6" = "#7570B3"  # Elegant purplish blue
+)
+
+plot_df <- na.omit(plot_df)
+
+# Plot
+fig_width = 3*0.8
+fig_height = 4*0.8
+pdf_file <- paste0(result_figure_dir, "barplot_AUC_compare_CXCL9_CA6_timePts_HCI002.pdf")
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+
+ggplot(plot_df, aes(x = Timepoint, y = AUC, fill = Protein)) +
+  geom_bar(stat = "identity", width = 0.7, position = position_dodge(width = 0.8)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+  geom_errorbar(
+    aes(ymin = AUC_low, ymax = AUC_up),
+    width = 0.2,
+    color = "black",
+    linewidth = 0.5,
+    position = position_dodge(width = 0.8)
+  ) +
+  scale_fill_manual(values = custom_colors) +
+  labs(x = "", y = "AUC") +
+  ylim(0, 0.8) + 
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.text.y = element_text(color = "black",size = 10),
+    axis.text.x = element_text(color = "black", angle = 15, hjust = 1,size = 10),
+    legend.position = "top",
+    legend.title = element_blank(),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 15)  
+  )
+
+dev.off()
+
+
+```
+
+# Figure 4E. K-M survival curves to test whether the CXCL9 signature could predict time-to-severe irAE (HCI002) 
+```{r}
+
+data_test_df <- cbind(HCI002_feature_df, HCI002_all_info0[c("IRAEactionable01", "RECIST01", "Response01", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", "IRAEgrade01")])
+
+feature_test <- "CXCL9_FC_on_pre" 
+quantile_cutoff <- 0.5
+phenotype_str <- "Nonsevere_irAE" 
+y_label_str <- "Severe-irAE-free \nsurvival probability"
+
+# get the predictor from the HCI002_all_info0
+predictor_df <- cbind(HCI002_all_info0[c("Vial ID", "patient_therapy")], data_test_df[feature_test]) 
+predictor_df$uniqueID <- paste0(predictor_df$patient_therapy, "_", predictor_df$`Vial ID`)
+predictor_df <- predictor_df[!duplicated(predictor_df$uniqueID), ]
+
+
+## load survival information
+survival_info_df <- read_excel("HCI002 Teiko clinical info 7.12.23_clean_newest.xlsx")
+survival_info_df <- survival_info_df[c("Vial ID", "Record ID", "Systemic Therapy Name", "Systemic Therapy Type", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event")]
+survival_info_df$uniqueID <- paste0(survival_info_df$`Record ID`, "_", survival_info_df$`Systemic Therapy Name`, "_", survival_info_df$`Systemic Therapy Type`, "_", survival_info_df$`Vial ID`)
+
+survival_all_info_HCI002 <- merge(predictor_df, survival_info_df, by = "uniqueID", x.all = T)
+
+survival_all_info_HCI002 <- survival_all_info_HCI002[!is.na(survival_all_info_HCI002[[feature_test]]), ]
+
+## convert days to months
+survival_all_info_HCI002$OS_time <- survival_all_info_HCI002$OS_time / 30
+survival_all_info_HCI002$PFS_time <- survival_all_info_HCI002$PFS_time / 30
+survival_all_info_HCI002$Nonsevere_irAE_time <- survival_all_info_HCI002$Nonsevere_irAE_time / 30
+
+############# Survival test for OS / PFS / time-irAEmax
+Score_Pred = survival_all_info_HCI002[[feature_test]]
+Score=Score_Pred
+exp_cutoff = quantile(Score_Pred, quantile_cutoff)
+#exp_cutoff = 0.04
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+cancerData=data.frame(Score,survival_all_info_HCI002[[paste0(phenotype_str, "_time")]],survival_all_info_HCI002[[paste0(phenotype_str, "_event")]])
+colnames(cancerData) = c("Score","OS_time","OS_event")
+
+sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+scox_coef = summary(scox)$coefficients
+HR_value = scox_coef[2] # hazard ratio
+Z_value=scox_coef[4]
+P_value=scox_coef[5]
+HR_CI = summary(scox)$conf.int[3:4]
+
+##### plot
+fontSize = 12
+survp=ggsurvplot(
+  sfit,
+  data = cancerData,
+  size = 1,                 # change line size
+  palette =
+    c("#00305d", "#9c1915"),# custom color palettes
+  conf.int = FALSE,          # Add confidence interval
+  pval = FALSE,              # Add p-value
+  xlim = c(-3,70),
+  ylim=c(0,1),
+  xlab = "Time (months)", ylab= y_label_str,#
+  break.time.by = 10,
+  risk.table=TRUE,
+  risk.table.height = 0.25, # Useful to change when you have multiple groups
+  risk.table.pos="out",
+  risk.table.col="black",
+  risk.table.y.text = FALSE,
+  tables.y.text = FALSE,
+  tables.theme = theme_cleantable(),
+  legend.labs =c("Low", "High"),    # Change legend labels
+  legend.title="",
+  legend = c(0.75, 0.975), # legend relative position
+  font.main = c(fontSize),
+  font.caption = c(fontSize),
+  font.legend = c(fontSize),
+  font.tickslab = c(fontSize),
+  font.x = c(fontSize),
+  font.y = c(fontSize),
+  ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                 plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                 panel.background = element_rect(fill = "white"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                 axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+) 
+survp$plot = survp$plot+
+            ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+pdf(paste0(result_figure_dir, "KM_curve_",phenotype_str,"_FoldChange_",feature_test,".pdf"),width=3.3, height=3)
+print(survp, newpage = FALSE)
+dev.off()
+
+```
+
+
+# Prepare input of different datasets for AUC
+```{r}
+
+### HCI001
+proteins_mapping <- setNames(HCI001_map_df$Assay, HCI001_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+proteins_test <- c("CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10", "IL12A", "IL21", "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19", "PGF", "CA6")
+proteins_test_OID <- HCI001_map_df$OlinkID[HCI001_map_df$Assay %in% proteins_test]
+
+joined_string <- paste(proteins_test_OID, collapse = "|")
+HCI001_feature_df <- HCI001_all_info0[grepl(joined_string, colnames(HCI001_all_info0))]
+time_pts <- c("FC_irAEmax_pre")
+joined_string <- paste(time_pts, collapse = "|")
+HCI001_feature_df <- HCI001_feature_df[grepl(joined_string, colnames(HCI001_feature_df))]
+colnames(HCI001_feature_df) <- gsub("_OLINK", "", colnames(HCI001_feature_df))
+# Replace OlinkID substrings with gene symbols
+for (oid in names(proteins_mapping)) {
+  gene <- proteins_mapping[[oid]]
+  colnames(HCI001_feature_df) <- gsub(oid, gene, colnames(HCI001_feature_df))
+}
+HCI001_feature_df$CXCL9_CA6_FC <- HCI001_feature_df$CXCL9_FC_irAEmax_pre - HCI001_feature_df$CA6_FC_irAEmax_pre
+joined_string <- paste(Integrated_proteins_vec, collapse = "|")
+HCI001_feature_df$Integrated_proteins_FC <- rowMeans(HCI001_feature_df[grepl(joined_string, colnames(HCI001_feature_df))])
+colnames(HCI001_feature_df) <- gsub("_irAEmax_pre", "", colnames(HCI001_feature_df))
+HCI001_feature_df$irAE_severe <- HCI001_all_info0$IRAEactionable01 # dim: 69 4
+
+HCI001_feature_df %>%
+  summarise(across(everything(), ~ median(.x, na.rm = TRUE)))
+print(colnames((HCI001_feature_df)))
+HCI001_feature_df$Patient_ID <- HCI001_all_info0$`RedCap ID`
+
+### HCI002
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+proteins_test_OID <- HCI002_map_df$OlinkID[HCI002_map_df$Assay %in% proteins_test]
+
+joined_string <- paste(proteins_test_OID, collapse = "|")
+HCI002_feature_df <- HCI002_all_info0[grepl(joined_string, colnames(HCI002_all_info0))]
+time_pts <- c("FC_on_pre")
+joined_string <- paste(time_pts, collapse = "|")
+HCI002_feature_df <- HCI002_feature_df[grepl(joined_string, colnames(HCI002_feature_df))]
+colnames(HCI002_feature_df) <- gsub("_OLINK", "", colnames(HCI002_feature_df))
+# Replace OlinkID substrings with gene symbols
+for (oid in names(proteins_mapping)) {
+  gene <- proteins_mapping[[oid]]
+  colnames(HCI002_feature_df) <- gsub(oid, gene, colnames(HCI002_feature_df))
+}
+HCI002_feature_df$CXCL9_CA6_FC <- HCI002_feature_df$CXCL9_FC_on_pre - HCI002_feature_df$CA6_FC_on_pre
+joined_string <- paste(Integrated_proteins_vec, collapse = "|")
+HCI002_feature_df$Integrated_proteins_FC <- rowMeans(HCI002_feature_df[grepl(joined_string, colnames(HCI002_feature_df))])
+colnames(HCI002_feature_df) <- gsub("_on_pre", "", colnames(HCI002_feature_df))
+HCI002_feature_df$irAE_severe <- HCI002_all_info0$IRAEactionable01 # dim: 167   4
+
+HCI002_feature_df %>%
+  summarise(across(everything(), ~ median(.x, na.rm = TRUE)))
+print(colnames((HCI002_feature_df)))
+HCI002_feature_df$Patient_ID <- HCI002_all_info0$patient_therapy
+
+
+## Nunez cohort1
+Nicolas_melanoma_info0 <- Nicolas_all_info0[Nicolas_all_info0$Cancer == "Melanoma", ]
+string_match <- paste0(paste(proteins_test, collapse = "_FC_T2_T1|"), "_FC_T2_T1")
+colnames(Nicolas_melanoma_info0) <- gsub("gamma", "G", colnames(Nicolas_melanoma_info0))
+Nicolas1_feature_df <- Nicolas_melanoma_info0[ , grepl(string_match, colnames(Nicolas_melanoma_info0), ignore.case = TRUE)]
+Nicolas1_feature_df$CXCL9_CA6_FC <- Nicolas_melanoma_info0$CXCL9_FC_T2_T1 # only CXCL9 measured, CA6 not measured
+joined_string <- paste(Integrated_proteins_vec, collapse = "|")
+Nicolas1_feature_df$Integrated_proteins_FC <- rowMeans(Nicolas1_feature_df[grepl(joined_string, colnames(Nicolas1_feature_df))])
+colnames(Nicolas1_feature_df) <- gsub("_T2_T1", "", colnames(Nicolas1_feature_df))
+Nicolas1_feature_df$`Patient ID` <- Nicolas_melanoma_info0$Patient.ID
+
+irAE_info_df = read_excel("Nunez1_Patient_character.xlsx", sheet = "Patient charact (Discovery)")
+irAE_info_df = irAE_info_df[c("Patient ID", "Autoimmune toxicities (grade)")]
+irAE_info_df = irAE_info_df[!is.na(irAE_info_df$`Patient ID`), ]
+irAE_info_df$irAE_severe = NA
+irAE_info_df$irAE_severe[grepl("1|2|^-$", irAE_info_df$`Autoimmune toxicities (grade)`)] = 0
+irAE_info_df$irAE_severe[grepl("3|4", irAE_info_df$`Autoimmune toxicities (grade)`)] = 1
+irAE_info_df$`Autoimmune toxicities (grade)` = NULL
+Nicolas1_feature_df = merge(Nicolas1_feature_df, irAE_info_df, by = "Patient ID") # dim: 25 4
+print(colnames((Nicolas1_feature_df)))
+Nicolas1_feature_df$Patient_ID <- Nicolas_melanoma_info0$`Patient.ID_new`
+
+
+## Nunez cohort2
+### Olink data
+Olinkdata_filename = paste0(data_dir, "Proteomics_non_log_normalized.xlsx") 
+Olinkdata_df <- read_excel(Olinkdata_filename)
+Olinkdata_df <- Olinkdata_df[Olinkdata_df$Cancer == "Melanoma", ]
+Olinkdata_df = Olinkdata_df[c("Patient_ID", "CXCL11 (T2/T1)", "CXCL9 (T2/T1)", "CXCL10 (T2/T1)", "IFNg (T2/T1)")]
+colnames(Olinkdata_df) <- c("Patient_ID", "CXCL11_FC", "CXCL9_FC", "CXCL10_FC", "IFNG_FC")
+Olinkdata_df$Patient_ID = toupper(Olinkdata_df$Patient_ID)
+
+# get CyTEK severe irAE annotation
+irAE_info_df = read_excel("Nunez2_Patient_character.xlsx", sheet = "Patient charact (Validation)")
+irAE_info_df$Patient_ID <- irAE_info_df$`Patient ID`
+irAE_info_df = irAE_info_df[c("Patient_ID", "Autoimmune toxicities (grade)")]
+irAE_info_df$irAE_severe = NA
+irAE_info_df$irAE_severe[grepl("1|2|^-$", irAE_info_df$`Autoimmune toxicities (grade)`)] = 0
+irAE_info_df$irAE_severe[grepl("3|4", irAE_info_df$`Autoimmune toxicities (grade)`)] = 1
+irAE_info_df$`Autoimmune toxicities (grade)` = NULL
+Nicolas2_feature_df = merge(Olinkdata_df, irAE_info_df, by = "Patient_ID")
+Nicolas2_feature_df$CXCL9_CA6_FC <- Nicolas2_feature_df$`CXCL9_FC` # only CXCL9 measured, CA6 not measured. dim: 123 7
+joined_string <- paste(Integrated_proteins_vec, collapse = "|")
+Nicolas2_feature_df$Integrated_proteins_FC <- rowMeans(Nicolas2_feature_df[grepl(joined_string, colnames(Nicolas2_feature_df))])
+
+```
+
+# Calculate AUCs of all predictors across all datasets
+```{r}
+
+# data frame of AUCs for different biomarkers
+AUC_result_df <- data.frame(
+  dataset = c("HCI002", "HCI001", "Nicolas1", "Nicolas2"), # Initialize dataset column with values
+  CXCL9_CA6 = NA,
+  CXCL9 = NA,
+  CXCL10 = NA,
+  CXCL11 = NA,
+  IFNG = NA,
+  CXCL13 = NA,
+  IL17A = NA,
+  IL10 = NA,
+  IL12A = NA,
+  IL21 = NA,
+  B4GALT1 = NA,
+  CD276 = NA,
+  CD70 = NA,
+  FLT3LG = NA,
+  FSTL3 = NA,
+  IL2RB = NA,
+  KRT19 = NA,
+  PGF = NA,
+  Integrated_proteins = NA
+)
+
+rownames(AUC_result_df) = AUC_result_df$dataset
+AUC_result_df$dataset = NULL
+
+
+#### compare AUCs of different biomarkers in HCI001
+all_single_predictors <- c(paste(colnames(AUC_result_df)[1:(ncol(AUC_result_df)-1)], "FC", sep = "_"))
+Integrated_proteins_predictor <- c(paste(Integrated_proteins_vec, "FC", sep = "_"))
+data_df <- as.data.frame(HCI001_feature_df)
+response <- data_df$irAE_severe
+AUC_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(data_df)){
+    predictor <- data_df[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC = as.numeric(auc(roc_obj))
+    AUC_vec = c(AUC_vec, AUC)
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+  }
+}
+predictor = rowSums(log1p(data_df[colnames(data_df) %in% Integrated_proteins_predictor]))
+roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+AUC = as.numeric(auc(roc_obj))
+AUC_vec = c(AUC_vec, AUC)
+AUC_result_df["HCI001", ] = AUC_vec
+
+
+#### compare AUCs of different biomarkers in HCI002
+data_df <- as.data.frame(HCI002_feature_df)
+response <- data_df$irAE_severe
+AUC_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(data_df)){
+    predictor <- data_df[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC = as.numeric(auc(roc_obj))
+    AUC_vec = c(AUC_vec, AUC)
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+  }
+}
+predictor = rowSums(log1p(data_df[colnames(data_df) %in% Integrated_proteins_predictor]))
+roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+AUC = as.numeric(auc(roc_obj))
+AUC_vec = c(AUC_vec, AUC)
+AUC_result_df["HCI002", ] = AUC_vec
+
+
+#### compare AUCs of different biomarkers in Nicolas1
+data_df <- as.data.frame(Nicolas1_feature_df)
+response <- data_df$irAE_severe
+AUC_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(data_df)){
+    predictor <- data_df[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC = as.numeric(auc(roc_obj))
+    AUC_vec = c(AUC_vec, AUC)
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+  }
+}
+predictor = rowSums(log1p(data_df[colnames(data_df) %in% Integrated_proteins_predictor]))
+roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+AUC = as.numeric(auc(roc_obj))
+AUC_vec = c(AUC_vec, AUC)
+AUC_result_df["Nicolas1", ] = AUC_vec
+
+
+#### compare AUCs of different biomarkers in Nicolas2
+data_df <- as.data.frame(Nicolas2_feature_df)
+response <- data_df$irAE_severe
+AUC_vec = c()
+for (sp in all_single_predictors){
+  if (sp %in% colnames(data_df)){
+    predictor <- data_df[[sp]]
+    roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+    AUC = as.numeric(auc(roc_obj))
+    AUC_vec = c(AUC_vec, AUC)
+  }else{
+    AUC_vec = c(AUC_vec, NA)
+  }
+}
+predictor = rowSums(log1p(data_df[colnames(data_df) %in% Integrated_proteins_predictor]))
+roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+AUC = as.numeric(auc(roc_obj))
+AUC_vec = c(AUC_vec, AUC)
+AUC_result_df["Nicolas2", ] = AUC_vec
+
+
+```
+
+
+# Figure 4F. Plot AUC comparison of different predictors (across 4 datasets)
+```{r}
+
+AUC_result_df$IL12A = NULL
+AUC_result_df$IL21 = NULL
+AUC_result_df$CXCL9_CA6 = NULL
+AUC_result_df$Integrated_proteins = NULL
+
+### Calculate mean values for each column, omitting NAs
+mean_values <- colMeans(AUC_result_df, na.rm = TRUE)
+AUC_result_df["Mean", ] <- mean_values
+
+ordered_cols <- order(-as.numeric(AUC_result_df["Mean", ]))
+AUC_result_df <- AUC_result_df[, ordered_cols]
+
+plot_vars = colnames(AUC_result_df)
+AUC_result_df2 = AUC_result_df[1:4,]
+AUC_result_df2 = AUC_result_df2[colnames(AUC_result_df2) %in% plot_vars]
+
+# Reshape the data to a long format
+AUC_result_df2$Dataset <- rownames(AUC_result_df2)
+AUC_result_df_long <- melt(AUC_result_df2, id.vars = "Dataset", variable.name = "GeneSignature", value.name = "AUC")
+
+# clean the labels
+AUC_result_df_long$Dataset[AUC_result_df_long$Dataset == "Nicolas1"] <- "Nunez 1"
+AUC_result_df_long$Dataset[AUC_result_df_long$Dataset == "Nicolas2"] <- "Nunez 2"
+AUC_result_df_long$Dataset = factor(AUC_result_df_long$Dataset, levels = c("HCI001","HCI002","Nunez 1","Nunez 2"))
+
+AUC_result_df_long$GeneSignature <- gsub("_", " ",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("CXCL9 CA6", "CXCL9 - CA6",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("Ki67", "Ki67+",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("CD38", "CD38+",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("CM", "cm",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("EM", "em",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("Eff", "emra",AUC_result_df_long$GeneSignature)
+AUC_result_df_long$GeneSignature <- gsub("IFNG", "IFN-gamma",AUC_result_df_long$GeneSignature)
+
+# Calculate the mean AUC for each gene signature
+gene_signature_means <- aggregate(AUC ~ GeneSignature, data = AUC_result_df_long, FUN = mean)
+
+# Order the gene signatures by mean AUC from high to low
+ordered_gene_signatures <- as.character(gene_signature_means$GeneSignature[order(gene_signature_means$AUC, decreasing = TRUE)])
+
+# Create a boxplot with different colors for each dataset
+pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_AllDatasets_Olink_FoldChange.pdf")) 
+fig_width = 4.5*1.2
+fig_height = 3.3*1.2
+dot_size <- 2
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(AUC_result_df_long, aes(x = GeneSignature, y = AUC)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", fill = "white", color = "black") +  
+  geom_jitter(aes(color = Dataset), position = position_jitter(0.2), size = dot_size) +  
+  scale_x_discrete(limits = ordered_gene_signatures) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+  labs(title = "", x = "", y = "AUC") +
+  ylim(0, 1) +
+  scale_color_manual(values = my.cols, name = "") +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.ticks.y = element_line(color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black", angle = 50, hjust = 1),
+        legend.spacing.y = unit(0.1, "cm"),  # reduce vertical space
+        legend.box.spacing = unit(0.1, "cm"), # optional: spacing between legend and plot
+        panel.border = element_blank(), legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(size = dot_size), nrow = 4))  
+dev.off()
+
+```

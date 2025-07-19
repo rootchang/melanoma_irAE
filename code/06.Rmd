@@ -1,0 +1,1160 @@
+---
+title: "Predicting irAE or ICBR with ML"
+author: "Tiangen Chang tiangen.chang@nih.gov"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+####### This script makes the below displays for the paper
+## Figure 5B-E
+## SFigure 6A-H
+
+```{r setup, include=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+```
+
+
+# load required package
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(viridis)
+library(tidyr)
+library(pROC)
+library(verification)
+
+library(dplyr)
+library(survival)
+library(survminer)
+
+
+library(glmnet)
+library(caret)
+library(ranger)
+library(readr)
+library(forestplot)
+
+```
+
+
+# parameters and constants and common functions
+```{r}
+
+my.cols <- c("#1c4f27", "#81144e", "#79831e", "#00305d", "#9c1915", "black", "grey", "#f58231", "#e6194b", "#3cb44b", "#42d4f4") 
+
+```
+
+# load data
+```{r}
+
+library(openxlsx)
+
+# Load the Excel sheet "HCI002" as a data frame
+complete_data <- read.xlsx("integrated_predictors_irAE.xlsx", sheet = "HCI002")
+# Split into predictors (all but last two columns) and outcomes
+x_train <- complete_data[, -c(ncol(complete_data)-1, ncol(complete_data)), drop = FALSE]  # all except last 2 cols
+y_train <- complete_data[, ncol(complete_data)-1]
+y_train_ICBR <- complete_data[, ncol(complete_data)]
+
+# Load the Excel sheet "HCI001" as a data frame
+complete_data <- read.xlsx("integrated_predictors_irAE.xlsx", sheet = "HCI001")
+# Split into predictors (all but last two columns) and outcomes
+x_val <- complete_data[, -c(ncol(complete_data)-1, ncol(complete_data)), drop = FALSE]  # all except last 2 cols
+y_val <- complete_data[, ncol(complete_data)-1]
+y_val_ICBR <- complete_data[, ncol(complete_data)]
+
+# Load the Excel sheet "Nicolas_FACS" as a data frame
+complete_data <- read.xlsx("integrated_predictors_irAE.xlsx", sheet = "Nicolas_FACS")
+# Split into predictors (all but last two columns) and outcomes
+x_val1 <- complete_data[, -c(ncol(complete_data)-1, ncol(complete_data)), drop = FALSE]  # all except last 2 cols
+y_val1 <- complete_data[, ncol(complete_data)-1]
+y_val1_ICBR <- complete_data[, ncol(complete_data)]
+
+# Load the Excel sheet "Nicolas_CyTEK" as a data frame
+complete_data <- read.xlsx("integrated_predictors_irAE.xlsx", sheet = "Nicolas_CyTEK")
+# Split into predictors (all but last two columns) and outcomes
+x_val2 <- complete_data[, -c(ncol(complete_data)-1, ncol(complete_data)), drop = FALSE]  # all except last 2 cols
+y_val2 <- complete_data[, ncol(complete_data)-1]
+y_val2_ICBR <- complete_data[, ncol(complete_data)]
+
+```
+
+# logistic regression model for CyTOF + Olink
+```{r}
+
+# (2) Fit logistic regression model
+train_data <- data.frame(y = y_train, x_train)
+logistic_model <- glm(y ~ ., data = train_data, family = "binomial")
+
+# (3) Predict probabilities on training data
+train_predictions <- predict(logistic_model, newdata = x_train, type = "response")
+train_auc_value <- roc(response = y_train, predictor = train_predictions, direction = "<", levels = c(0, 1), quiet = TRUE)$auc
+
+# (4) Predict probabilities on validation data
+val_predictions <- predict(logistic_model, newdata = x_val, type = "response")
+val_auc_value <- roc(response = y_val, predictor = val_predictions, direction = "<", levels = c(0, 1), quiet = TRUE)$auc
+
+val_predictions2 <- predict(logistic_model, newdata = x_val2, type = "response")
+val_auc_value2 <- roc(response = y_val2, predictor = val_predictions2, direction = "<", levels = c(0, 1), quiet = TRUE)$auc
+
+val_predictions3 <- predict(logistic_model, newdata = x_val3, type = "response")
+val_auc_value3 <- roc(response = y_val3, predictor = val_predictions3, direction = "<", levels = c(0, 1), quiet = TRUE)$auc
+
+# (5) Print AUC values
+cat("Training AUC:", train_auc_value, "\n")
+cat("Validation AUC:", val_auc_value, "\n")
+cat("Validation2 AUC:", val_auc_value2, "\n")
+cat("Validation3 AUC:", val_auc_value3, "\n")
+
+mean(c(train_auc_value, val_auc_value, val_auc_value2, val_auc_value3)) # 0.775742
+
+```
+
+# Calculate AUCs/OddsRatios of all predictors across all datasets
+```{r}
+
+# data frame of AUCs for different biomarkers
+AUC_result_df <- data.frame(
+  dataset = c("HCI002", "HCI001", "Nicolas1", "Nicolas2"), 
+  `Activated CD8Tcm` = NA,
+  CXCL9 = NA,
+  Integrated = NA, 
+  check.names = F
+)
+rownames(AUC_result_df) = AUC_result_df$dataset
+AUC_result_df$dataset = NULL
+
+# data frame of AUCs for different biomarkers
+AUC_ICBR_result_df <- data.frame(
+  dataset = c("HCI002", "HCI001", "Nicolas1", "Nicolas2"), # Initialize dataset column with values
+  `Activated CD8Tcm` = NA,
+  CXCL9 = NA,
+  Integrated = NA, 
+  check.names = F
+)
+rownames(AUC_ICBR_result_df) = AUC_ICBR_result_df$dataset
+AUC_ICBR_result_df$dataset = NULL
+
+# data frame of AUCs for different biomarkers
+OR_result_df <- data.frame(
+  dataset = c("HCI002", "HCI001", "Nicolas1", "Nicolas2"), # Initialize dataset column with values
+  `Activated CD8Tcm` = NA,
+  CXCL9 = NA,
+  Integrated = NA, 
+  check.names = F
+)
+rownames(OR_result_df) = OR_result_df$dataset
+OR_result_df$dataset = NULL
+
+roc_obj <- roc(y_train, x_train[,1], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC2 <- as.numeric(auc(roc_obj))
+auc_ICBR_2 <- as.numeric(auc(roc(y_train_ICBR, x_train[,1], direction = "<", levels = c(0, 1), quiet = TRUE)))
+OR2 <- mean(y_train[x_train[,1] > 0]) / mean(y_train[x_train[,1] <= 0])
+roc_obj <- roc(y_train, x_train[,2], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC1 <- as.numeric(auc(roc_obj))
+auc_ICBR_1 <- as.numeric(auc(roc(y_train_ICBR, x_train[,2], direction = "<", levels = c(0, 1), quiet = TRUE)))
+OR1 <- mean(y_train[x_train[,2] > 0]) / mean(y_train[x_train[,2] <= 0])
+roc_obj <- roc(y_train, train_predictions, direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC3 <- as.numeric(auc(roc_obj))
+auc_ICBR_3 <- as.numeric(auc(roc(y_train_ICBR, train_predictions, direction = "<", levels = c(0, 1), quiet = TRUE)))
+AUC_result_df[1, ] <- c(AUC1, AUC2, AUC3)
+AUC_ICBR_result_df[1, ] <- c(auc_ICBR_1, auc_ICBR_2, auc_ICBR_3)
+best_coords <- coords(roc_obj, "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity", "youden"))
+threshold_val <- best_coords[[1]]
+OR3 <- mean(y_train[train_predictions > threshold_val]) / mean(y_train[train_predictions <= threshold_val])
+OR_result_df[1, ] <- c(OR1, OR2, OR3)
+
+
+roc_obj <- roc(y_val, x_val[,1], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC2 <- as.numeric(auc(roc_obj))
+auc_ICBR_2 <- as.numeric(auc(roc(y_val_ICBR, x_val[,1], direction = "<", levels = c(0, 1), quiet = TRUE)))
+OR2 <- mean(y_val[x_val[,1] > 0]) / mean(y_val[x_val[,1] <= 0])
+roc_obj <- roc(y_val, x_val[,2], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC1 <- as.numeric(auc(roc_obj))
+auc_ICBR_1 <- as.numeric(auc(roc(y_val_ICBR, x_val[,2], direction = "<", levels = c(0, 1), quiet = TRUE)))
+OR1 <- mean(y_val[x_val[,2] > 0]) / mean(y_val[x_val[,2] <= 0])
+roc_obj <- roc(y_val, val_predictions, direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC3 <- as.numeric(auc(roc_obj))
+auc_ICBR_3 <- as.numeric(auc(roc(y_val_ICBR, val_predictions, direction = "<", levels = c(0, 1), quiet = TRUE)))
+AUC_result_df[2, ] <- c(AUC1, AUC2, AUC3)
+AUC_ICBR_result_df[2, ] <- c(auc_ICBR_1, auc_ICBR_2, auc_ICBR_3)
+OR3 <- mean(y_val[val_predictions > threshold_val]) / mean(y_val[val_predictions <= threshold_val])
+OR_result_df[2, ] <- c(OR1, OR2, OR3)
+
+
+roc_obj <- roc(y_val2, x_val2[,1], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC2 <- as.numeric(auc(roc_obj))
+OR2 <- mean(y_val2[x_val2[,1] > 0]) / mean(y_val2[x_val2[,1] <= 0])
+roc_obj <- roc(y_val2, x_val2[,2], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC1 <- as.numeric(auc(roc_obj))
+OR1 <- mean(y_val2[x_val2[,2] > 0]) / mean(y_val2[x_val2[,2] <= 0])
+roc_obj <- roc(y_val2, val_predictions2, direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC3 <- as.numeric(auc(roc_obj))
+AUC_result_df[3, ] <- c(AUC1, AUC2, AUC3)
+OR3 <- mean(y_val2[val_predictions2 > threshold_val]) / mean(y_val2[val_predictions2 <= threshold_val])
+OR_result_df[3, ] <- c(OR1, OR2, OR3)
+
+roc_obj <- roc(y_val3, x_val3[,1], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC2 <- as.numeric(auc(roc_obj))
+OR2 <- mean(y_val3[x_val3[,1] > 0]) / mean(y_val3[x_val3[,1] <= 0])
+roc_obj <- roc(y_val3, x_val3[,2], direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC1 <- as.numeric(auc(roc_obj))
+OR1 <- mean(y_val3[x_val3[,2] > 0]) / mean(y_val3[x_val3[,2] <= 0])
+roc_obj <- roc(y_val3, val_predictions3, direction = "<", levels = c(0, 1), quiet = TRUE)
+AUC3 <- as.numeric(auc(roc_obj))
+AUC_result_df[4, ] <- c(AUC1, AUC2, AUC3)
+OR3 <- mean(y_val3[val_predictions3 > threshold_val]) / mean(y_val3[val_predictions3 <= threshold_val])
+OR_result_df[4, ] <- c(OR1, OR2, OR3)
+
+```
+
+# Figure 5B. Plot AUC comparison of different predictors (across 4 datasets)
+```{r}
+
+### Calculate mean values for each column, omitting NAs
+mean_values <- colMeans(AUC_result_df, na.rm = TRUE)
+AUC_result_df["Mean", ] <- mean_values
+
+ordered_cols <- order(-as.numeric(AUC_result_df["Mean", ]))
+AUC_result_df <- AUC_result_df[, ordered_cols]
+
+plot_vars = colnames(AUC_result_df)
+AUC_result_df2 = AUC_result_df[1:4,]
+AUC_result_df2 = AUC_result_df2[colnames(AUC_result_df2) %in% plot_vars]
+
+# Reshape the data to a long format
+AUC_result_df2$Dataset <- rownames(AUC_result_df2)
+AUC_result_df_long <- melt(AUC_result_df2, id.vars = "Dataset", variable.name = "GeneSignature", value.name = "AUC")
+
+# clean the labels
+AUC_result_df_long$Dataset[AUC_result_df_long$Dataset == "Nicolas1"] <- "Nunez 1"
+AUC_result_df_long$Dataset[AUC_result_df_long$Dataset == "Nicolas2"] <- "Nunez 2"
+AUC_result_df_long$Dataset = factor(AUC_result_df_long$Dataset, levels = c("HCI001","HCI002","Nunez 1","Nunez 2"))
+
+AUC_result_df_long$GeneSignature <- gsub("_", " ",AUC_result_df_long$GeneSignature)
+
+# Calculate the mean AUC for each gene signature
+gene_signature_means <- aggregate(AUC ~ GeneSignature, data = AUC_result_df_long, FUN = mean)
+
+# Order the gene signatures by mean AUC from high to low
+ordered_gene_signatures <- as.character(gene_signature_means$GeneSignature[order(gene_signature_means$AUC, decreasing = F)])
+
+# Create a boxplot with different colors for each dataset
+pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_AllDatasets_Combined_actCD8TCM_CXCL9.pdf")) 
+fig_width = 2.5
+fig_height = 3.3
+dot_size <- 2
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(AUC_result_df_long, aes(x = GeneSignature, y = AUC)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", fill = "white", color = "black") +  
+  stat_summary(
+    fun.data = "mean_se",  # Calculate mean and standard error
+    geom = "errorbar",
+    width = 0.4,           # Width of error bars (adjust as needed)
+    position = position_dodge(0.9)  # Align error bars with bars
+  ) +
+  geom_jitter(aes(color = Dataset), position = position_jitter(0.2), size = dot_size) +  
+  scale_x_discrete(limits = ordered_gene_signatures) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+  labs(title = "", x = "", y = "AUC") +
+  ylim(0, 1) +
+  scale_color_manual(values = my.cols, name = "") +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.ticks.y = element_line(color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black", angle = 50, hjust = 1),
+        legend.spacing.y = unit(0.1, "cm"),  # reduce vertical space
+        legend.box.spacing = unit(0.1, "cm"), # optional: spacing between legend and plot
+        panel.border = element_blank(), legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(size = dot_size), nrow = 4))  
+dev.off()
+
+t.test(AUC_result_df$Integrated, AUC_result_df$`Activated CD8Tcm`, paired = T)
+t.test(AUC_result_df$Integrated, AUC_result_df$CXCL9, paired = T)
+
+```
+
+# Figure 5C-D/SFigure 6A,G,H. Feature importance and K-M survival curves (irAE-free, OS, PFS etc) to test whether the signature could predict time-to-severe irAE (HCI002)
+```{r}
+
+#### HCI002
+phenotype_df_HCI002 = HCI002_all_info[,phenotype_name, drop = F]
+HCI002_filtered_info = HCI002_all_info[grepl("OLINK_baseline$", colnames(HCI002_all_info), ignore.case = T)] 
+colnames(HCI002_filtered_info) <- gsub("_OLINK_baseline", "", colnames(HCI002_filtered_info))
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+colnames(HCI002_filtered_info) <- proteins_mapping[colnames(HCI002_filtered_info)]
+HCI002_filtered_info <- HCI002_filtered_info[, !duplicated(colnames(HCI002_filtered_info))]
+HCI002_filtered_info <- HCI002_filtered_info[, c("CXCL9"), drop = F]
+HCI002_filtered_info$CD8T_CM_tripletORp_ratio_baseline <- HCI002_all_info$CD8T_CM_tripletORp_ratio_baseline
+HCI002_filtered_info[[phenotype_name]] <- HCI002_all_info[[phenotype_name]] 
+HCI002_filtered_info$patient_therapy <- HCI002_all_info$patient_therapy
+
+# HCI002 train
+complete_data <- cbind(scale(HCI002_filtered_info[c(1,2)]), HCI002_filtered_info[c(3,4)])
+complete_data <- complete_data[complete.cases(complete_data[c(1,2,3)]), ]
+# Separate back into x and y
+x_train <-complete_data[, c(1,2),drop=F]
+y_train <- complete_data[, c(3)]
+train_data <- data.frame(y = y_train, x_train)
+logistic_model <- glm(y ~ ., data = train_data, family = "binomial")
+train_predictions <- predict(logistic_model, newdata = x_train, type = "response")
+complete_data$MLpredictor <- train_predictions
+
+######################## plot feature importance (start) ########################
+# Create a data frame with feature names, coefficients, and direction
+coefs <- coef(logistic_model)
+coefs <- coefs[-1]  # remove the intercept
+features <- data.frame(
+  Feature = c("CXCL9", "Activated CD8Tcm"),
+  Coefficient = c(coefs[["CXCL9"]],coefs[["CD8T_CM_tripletORp_ratio_baseline"]]),
+  Importance = abs(c(coefs[["CXCL9"]], coefs[["CD8T_CM_tripletORp_ratio_baseline"]])),  # Absolute value for bar height
+  Direction = c("Negative", "Positive")   # Indicate direction based on sign
+)
+
+# Sort by importance (descending)
+features <- features %>% arrange(desc(Importance))
+
+# Create the bar plot
+fig_width = 3.5*0.8
+fig_height = 4.5*0.8
+pdf_file <- paste0(result_figure_dir, "barplot_featureImportance_IntegratedML_irAE_HCI002.pdf")
+pdf(pdf_file, onefile = FALSE, width = fig_width, height = fig_height)
+ggplot(features, aes(x = reorder(Feature, Importance), y = Importance, fill = Direction)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +
+  # Customize colors for direction
+  scale_fill_manual(values = c("Negative" = "#d62728", "Positive" = "#1f77b4")) +
+  # Add coefficient values on top of bars
+  geom_text(aes(label = sprintf("%.2f", Coefficient), y = Importance + 0.04), size = 4) +
+  ylim(c(0,0.8))+
+  labs(
+    title = "",
+    x = "",
+    y = "Feature importance",
+    fill = "Effect Direction"
+  ) +
+  theme_minimal()+
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+    legend.position = "right", 
+    legend.title = element_blank()
+    )
+dev.off()
+######################## plot feature importance (end) ########################
+
+
+## load survival information
+survival_info_df <- read_excel("HCI002 Teiko clinical info 7.12.23_clean_newest.xlsx")
+survival_info_df <- survival_info_df[c("Vial ID", "Record ID", "Systemic Therapy Name", "Systemic Therapy Type", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event")]
+survival_info_df$patient_therapy <- paste0(survival_info_df$`Record ID`, "_", survival_info_df$`Systemic Therapy Name`, "_", survival_info_df$`Systemic Therapy Type`)
+survival_info_df <- survival_info_df[!(duplicated(survival_info_df$patient_therapy)), ]
+survival_all_info_HCI002 <- merge(complete_data, survival_info_df, by = "patient_therapy", x.all = T)
+
+## convert days to months
+survival_all_info_HCI002$OS_time <- survival_all_info_HCI002$OS_time / 30
+survival_all_info_HCI002$PFS_time <- survival_all_info_HCI002$PFS_time / 30
+survival_all_info_HCI002$Nonsevere_irAE_time <- survival_all_info_HCI002$Nonsevere_irAE_time / 30
+
+############# Survival test for OS / PFS / time-irAEmax
+predictor_name <- "MLpredictor"
+therapy_type_vec <- c("active", "All", "adjuvant", "neoadjuvant") 
+phenotype_str_vec <- c("OS", "PFS", "Nonsevere_irAE") 
+
+for(therapy_type in therapy_type_vec){
+  for (phenotype_str in phenotype_str_vec){
+    if (phenotype_str == "OS"){
+      y_label_str <- "Overall \nsurvival probability" 
+    }else if (phenotype_str == "PFS"){
+      y_label_str <- "Progression-free \nsurvival probability"
+    }else if (phenotype_str == "Nonsevere_irAE"){
+      y_label_str <- "Severe-irAE-free \nsurvival probability"
+    }
+    
+    ### separate with `Systemic Therapy Type`
+    if (therapy_type == "active"){
+      selected_rows <- (survival_all_info_HCI002$`Systemic Therapy Type` == "active treatment")
+    }else if (therapy_type == "All"){
+      selected_rows <- (1:nrow(survival_all_info_HCI002))
+    }else{
+      selected_rows <- survival_all_info_HCI002$`Systemic Therapy Type` == therapy_type
+    }
+    Score_Pred <- survival_all_info_HCI002[selected_rows, feature_test] 
+    Score <- Score_Pred
+    exp_cutoff <- quantile(Score_Pred, 0.5)
+    Score[Score_Pred>exp_cutoff]="High"
+    Score[Score_Pred<=exp_cutoff]="Low"
+    Score <- factor(Score)
+    Score <- relevel(Score, ref = "Low")
+    cancerData=data.frame(Score,survival_all_info_HCI002[selected_rows, paste0(phenotype_str, "_time")],survival_all_info_HCI002[selected_rows, paste0(phenotype_str, "_event")])
+    colnames(cancerData) = c("Score","OS_time","OS_event")
+    
+    sfit <- survfit(Surv(OS_time, OS_event) ~ Score, data=cancerData)
+    scox <- coxph(Surv(OS_time, OS_event)~Score, data=cancerData)
+    scox_coef = summary(scox)$coefficients
+    HR_value = scox_coef[2] # hazard ratio
+    Z_value=scox_coef[4]
+    P_value=scox_coef[5]
+    HR_CI = summary(scox)$conf.int[3:4]
+
+    ##### plot
+    fontSize = 12
+    survp=ggsurvplot(
+      sfit,
+      data = cancerData,
+      size = 1,                 # change line size
+      palette =
+        c("#00305d", "#9c1915"),# custom color palettes
+      conf.int = FALSE,          # Add confidence interval
+      pval = FALSE,              # Add p-value
+      xlim = c(-3,70),
+      ylim=c(0,1),
+      xlab = "Time (months)", ylab= y_label_str,# 
+      break.time.by = 10,
+      risk.table=TRUE,
+      risk.table.height = 0.25, # Useful to change when you have multiple groups
+      risk.table.pos="out",
+      risk.table.col="black",
+      risk.table.y.text = FALSE,
+      tables.y.text = FALSE, 
+      tables.theme = theme_cleantable(),
+      legend.labs =c("Low", "High"),    # Change legend labels
+      legend.title="",
+      legend = c(0.5, 0.98), # c(0.75, 0.7) 0.4, 0.98
+      font.main = c(fontSize),
+      font.caption = c(fontSize),
+      font.legend = c(fontSize),
+      font.tickslab = c(fontSize),
+      font.x = c(fontSize),
+      font.y = c(fontSize),
+      ggtheme = theme(legend.background = element_rect(fill = NA, color=NA),legend.key = element_rect(fill = NA, color=NA),
+                     plot.margin = unit(c(0.2, 0.2, 0, 0.2),"cm"),
+                     panel.background = element_rect(fill = "white"),
+                     panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                     panel.border = element_blank(),axis.line = element_line(colour = "black"),
+                     axis.text.x = element_text(colour="black"),axis.text.y = element_text(colour="black")),  # top, right, bot, left
+    )
+    survp$plot <- survp$plot + guides(color = guide_legend(nrow = 1))
+    survp$plot = survp$plot+ 
+                ggplot2::annotate("text", x=0, y=0.15, label=paste0('HR',' = ',round(HR_value,2),' (', round(HR_CI[1],2),'-',round(HR_CI[2],2),')','\n','p = ',sprintf('%.3f', P_value)),size = 5, hjust = 0)
+    pdf(paste0(result_figure_dir, "KM_curve_",therapy_type,"_",phenotype_str,"_", predictor_name,".pdf"),width=3.3, height=3)
+    print(survp, newpage = FALSE)
+    dev.off()
+  }
+}
+
+```
+
+# Data preparation: multi-variate Cox regression (Sex, age, stage, ICB experience, severe irAEs) in HCI002
+```{r}
+
+feature_test <- "MLpredictor"  # CD8T_CM_tripletORp_ratio_baseline MLpredictor CXCL9
+phenotype_str <- "OS" # Nonsevere_irAE OS PFS
+y_label_str <- "Overall \nsurvival probability" # Severe-irAE-free \nsurvival probability; Overall survival OS probability; Progression-free survival PFS probability; 
+
+# get the predictor from the HCI002_all_info
+predictor_df <- HCI002_all_info[c("patient_therapy", "Gender", "Age at C1", "ICI Naïve?", "Systemic Therapy Type", "Baseline Stage / TNM", "Last Cycle Number", "Duration of treatment", "IRAEactionable01", "Systemic Therapy Name")]
+predictor_df$Sex <- ifelse(predictor_df$Gender == "Male",1,0)
+predictor_df$Sex <- factor(predictor_df$Sex, levels = c(0,1))
+predictor_df$Age <- predictor_df$`Age at C1`
+predictor_df$previousICB <- ifelse(predictor_df$`ICI Naïve?` == "Yes",0,1)
+predictor_df$previousICB <- factor(predictor_df$previousICB, levels = c(0,1))
+predictor_df$activeICB <- ifelse(predictor_df$`Systemic Therapy Type` == "active treatment",1,0)
+predictor_df$activeICB <- factor(predictor_df$activeICB, levels = c(0,1))
+predictor_df$Stage <- ifelse(grepl("Stage IV", predictor_df$`Baseline Stage / TNM`),1,0)
+predictor_df$Stage <- factor(predictor_df$Stage, levels = c(0,1))
+predictor_df$ICBcycles <- predictor_df$`Last Cycle Number` # no need, redundant to ICBduration
+predictor_df$ICBduration <- predictor_df$`Duration of treatment`
+predictor_df$Drug = "PD1/PDL1"
+predictor_df$Drug[predictor_df$`Systemic Therapy Name` %in% c("Nivolumab/ Ipilimumab", "PD1-CTLA4 bispecific", "Ipi 10 / temozolomide", "Nivolumab/ Ipilimumab flipped dose", "Ipi 3 / temozolomide", "Pembrolizumab / CTLA-4-LAG3 bispecific", "CTLA-4-LAG3 bispecific", "Pembrolizumab/ anti-CTLA4", "anti-CTLA4")] = "CTLA4-containing"
+
+predictor_df <- merge(complete_data[c("patient_therapy", feature_test)], predictor_df, by = "patient_therapy")
+
+predictor_df <- predictor_df[c("patient_therapy", feature_test, "Sex", "Age", "previousICB", "activeICB", "Stage", "ICBduration", "IRAEactionable01", "Drug", "ICBcycles")]
+
+predictor_df <- na.omit(predictor_df)
+predictor_df <- predictor_df[!duplicated(predictor_df$patient_therapy), ]
+
+## load survival information
+survival_info_df <- read_excel("/Users/changt7/Documents/00.PostDocWork/CancerResearch/01.Projects/00.Collaborating_projects/10.UUtahPIVOTCenter_Siwen/02.Input/Siwen_mainCohort/HCI002/HCI002 Teiko clinical info 7.12.23_clean_newest.xlsx")
+survival_info_df <- survival_info_df[c("Vial ID", "Record ID", "Systemic Therapy Name", "Systemic Therapy Type", "OS_time", "OS_event", "PFS_time", "PFS_event", "Nonsevere_irAE_time", "Nonsevere_irAE_event")]
+survival_info_df$patient_therapy <- paste0(survival_info_df$`Record ID`, "_", survival_info_df$`Systemic Therapy Name`, "_", survival_info_df$`Systemic Therapy Type`)
+
+survival_info_df <- survival_info_df[!duplicated(survival_info_df$patient_therapy), ]
+
+survival_all_info_HCI002 <- merge(predictor_df, survival_info_df, by = "patient_therapy", x.all = T)
+
+survival_all_info_HCI002 <- survival_all_info_HCI002[!is.na(survival_all_info_HCI002[[feature_test]]), ]
+
+## convert days to months
+survival_all_info_HCI002$OS_time <- survival_all_info_HCI002$OS_time / 30
+survival_all_info_HCI002$PFS_time <- survival_all_info_HCI002$PFS_time / 30
+survival_all_info_HCI002$Nonsevere_irAE_time <- survival_all_info_HCI002$Nonsevere_irAE_time / 30
+
+
+
+```
+
+
+# Figure 5E. OS/PFS Forest plot in HCI002
+```{r}
+Outcome_all = c("OS_time", "OS_event", "PFS_time", "PFS_event")
+test_var <- feature_test
+test_var_show <- "Integrated" # Activated CD8Tcm; Integrated
+control_vars <- c("Age", "Sex", "Stage", "Drug", "previousICB", "IRAEactionable01") 
+control_vars_show <- c("Age", "Sex (Female vs male)", "Stage (IV vs I-III)", "Drug (anti-PD(L)1 vs\n anti-CTLA4-containing)", "Previous ICB therapy", "Severe irAE")
+columns_keep = c(test_var, control_vars, Outcome_all)
+
+all_info <- survival_all_info_HCI002[columns_keep]
+
+colnames(all_info) <- c(test_var, control_vars, "OS_time", "OS_event", "PFS_time", "PFS_event")
+
+result_df = data.frame(Variable = character(),
+                       HR_OS = numeric(),
+                       HR_OS_low = numeric(),
+                       HR_OS_up = numeric(),
+                       p_val_OS = numeric(),
+                       HR_PFS = numeric(),
+                       HR_PFS_low = numeric(),
+                       HR_PFS_up = numeric(),
+                       p_val_PFS = numeric())
+result_df[length(control_vars)+1,]=NA
+cancerData_all = all_info
+
+cn = test_var
+Score_Pred = cancerData_all[[cn]]
+Score=Score_Pred
+exp_cutoff = median(Score)
+Score[Score_Pred>exp_cutoff]="High"
+Score[Score_Pred<=exp_cutoff]="Low"
+Score <- factor(Score)
+Score <- relevel(Score, ref = "Low")
+##### OS
+cancerData=data.frame(Score,cancerData_all[c(control_vars,"OS_time","OS_event")])
+colnames(cancerData) = c("Score",control_vars,"OS_time","OS_event")
+cancerData = na.omit(cancerData)
+# Combine Score and control variables into a formula string
+formula_str <- paste("Surv(OS_time, OS_event) ~ Score +", paste(control_vars, collapse = " + "))
+# Convert to formula
+sfit_formula <- as.formula(formula_str)
+# Fit the model
+sfit <- survfit(sfit_formula, data = cancerData)
+# Fit Cox proportional hazards model
+scox_OS <- coxph(sfit_formula, data = cancerData)
+scox_coef_OS = summary(scox_OS)$coefficients
+
+
+##### PFS
+cancerData=data.frame(Score,cancerData_all[c(control_vars,"PFS_time","PFS_event")])
+colnames(cancerData) = c("Score",control_vars,"PFS_time","PFS_event")
+cancerData = na.omit(cancerData)
+# Combine Score and control variables into a formula string
+formula_str <- paste("Surv(PFS_time, PFS_event) ~ Score +", paste(control_vars, collapse = " + "))
+# Convert to formula
+sfit_formula <- as.formula(formula_str)
+# Fit the model
+sfit <- survfit(sfit_formula, data = cancerData)
+# Fit Cox proportional hazards model
+scox_PFS <- coxph(sfit_formula, data = cancerData)
+scox_coef_PFS = summary(scox_PFS)$coefficients
+
+
+result_df[,1] = c(test_var_show, control_vars_show)
+result_df[,2] = scox_coef_OS[,2]
+result_df[,3] = summary(scox_OS)$conf.int[,3]
+result_df[,4] = summary(scox_OS)$conf.int[,4]
+result_df[,5] = scox_coef_OS[,5]
+result_df[,6] = scox_coef_PFS[,2]
+result_df[,7] = summary(scox_PFS)$conf.int[,3]
+result_df[,8] = summary(scox_PFS)$conf.int[,4]
+result_df[,9] = scox_coef_PFS[,5]
+
+######### forest plot of OS HR and p-value
+plot_data <- tibble::tibble(mean  = result_df[["HR_OS"]],
+                            lower = result_df[["HR_OS_low"]],
+                            upper = result_df[["HR_OS_up"]],
+                            Variable = result_df$Variable,
+                            effSize = round(result_df[["HR_OS"]],3),
+                            pval = result_df[["p_val_OS"]])
+
+options(scipen = 999)
+P_value_raw = plot_data[['pval']]
+
+pval_vec = vector("character", length(P_value_raw))
+for (i in 1:length(P_value_raw)){
+  pval = P_value_raw[i]
+  if (pval>=0.05){
+    pval_vec[i] = as.character(round(pval,2))
+  }else if (pval>=0.0095){
+    pval_vec[i] = as.character(round(pval,3))
+  }else{
+    pval_vec[i] = format(pval, scientific = TRUE, digits = 2)  # Format for scientific notation
+  }
+}
+
+plot_data$pval = pval_vec
+
+xmin_lim = 0
+xmax_lim = 4
+breaks_x = c(0,1,2,3)
+labels_x = breaks_x
+
+
+pdf_file <- paste0(result_figure_dir,paste0("Forest_HCI002_IntegratedML_clinicalVARs_MHR_OS.pdf"))
+fig_width = 5.5
+fig_height = 4.4
+fontSize = 1.2
+xlabel = "HR of OS"
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+plot_data %>%
+  forestplot(labeltext = c("effSize", "Variable", "pval"),
+             graph.pos = 3,
+             boxsize = 0.35,
+             vertices = TRUE,
+             clip = c(xmin_lim, xmax_lim),
+             xlog = FALSE,
+             zero = 1, # dashed line position
+             txt_gp = fpTxtGp(ticks=gpar(cex=fontSize),xlab=gpar(cex=fontSize),label=gpar(cex=fontSize),legend=gpar(cex=fontSize),title=gpar(cex=fontSize)), 
+             xlab = xlabel, # Kaplan-Meier   Multivariable
+             xticks = breaks_x,
+             graphwidth = unit(3, "cm"),
+             lineheight = unit(2, "cm")
+             ) %>%
+  fp_set_style(box = "black",
+               line = "black",
+               align = "llr", 
+               summary = "black") %>%
+  fp_add_header(effSize = c("HR")|> fp_txt_plain() |> fp_align_left(),
+                Variable = c("Variable")|> fp_txt_plain() |> fp_align_left(),
+                pval = c("P-value")|> fp_txt_plain() |> fp_align_right())
+
+dev.off()
+
+
+
+
+######### forest plot of PFS HR and p-value
+plot_data <- tibble::tibble(mean  = result_df[["HR_PFS"]],
+                            lower = result_df[["HR_PFS_low"]],
+                            upper = result_df[["HR_PFS_up"]],
+                            Variable = result_df$Variable,
+                            effSize = round(result_df[["HR_PFS"]],3),
+                            pval = result_df[["p_val_PFS"]])
+
+options(scipen = 999)
+P_value_raw = plot_data[['pval']]
+
+pval_vec = vector("character", length(P_value_raw))
+for (i in 1:length(P_value_raw)){
+  pval = P_value_raw[i]
+  if (pval>=0.05){
+    pval_vec[i] = as.character(round(pval,2))
+  }else if (pval>=0.0095){
+    pval_vec[i] = as.character(round(pval,3))
+  }else{
+    pval_vec[i] = format(pval, scientific = TRUE, digits = 2)  
+  }
+}
+plot_data$pval = pval_vec
+
+xmin_lim = 0
+xmax_lim = 4
+breaks_x = c(0,1,2,3)
+labels_x = breaks_x
+
+
+pdf_file <- paste0(result_figure_dir,paste0("Forest_HCI002_IntegratedML_clinicalVARs_MHR_PFS.pdf"))
+xlabel = "HR of PFS"
+
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+plot_data %>%
+  forestplot(labeltext = c("effSize", "Variable", "pval"),
+             graph.pos = 3,
+             boxsize = 0.35,
+             vertices = TRUE,
+             clip = c(xmin_lim, xmax_lim),
+             xlog = FALSE,
+             zero = 1, 
+             txt_gp = fpTxtGp(ticks=gpar(cex=fontSize),xlab=gpar(cex=fontSize),label=gpar(cex=fontSize),legend=gpar(cex=fontSize),title=gpar(cex=fontSize)), 
+             xlab = xlabel, 
+             xticks = breaks_x,
+             graphwidth = unit(3, "cm"),
+             lineheight = unit(2, "cm")
+             ) %>%
+  fp_set_style(box = "black",
+               line = "black",
+               align = "llr", # hrz_lines = "#999999"
+               summary = "black") %>%
+  fp_add_header(effSize = c("HR")|> fp_txt_plain() |> fp_align_left(),
+                Variable = c("Variable")|> fp_txt_plain() |> fp_align_left(),
+                pval = c("P-value")|> fp_txt_plain() |> fp_align_right())
+
+dev.off()
+
+```
+
+
+
+# SFigure 6C,E,F. Plot comparison of difference of activated CD8TCM cell abundance in different sex, age, ICB experience, ... groups (in HCI002)
+```{r}
+#### HCI002
+phenotype_df_HCI002 = HCI002_all_info[,phenotype_name, drop = F]
+HCI002_filtered_info = HCI002_all_info[grepl("OLINK_baseline$", colnames(HCI002_all_info), ignore.case = T)] 
+colnames(HCI002_filtered_info) <- gsub("_OLINK_baseline", "", colnames(HCI002_filtered_info))
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+colnames(HCI002_filtered_info) <- proteins_mapping[colnames(HCI002_filtered_info)]
+HCI002_filtered_info <- HCI002_filtered_info[, !duplicated(colnames(HCI002_filtered_info))]
+HCI002_filtered_info <- HCI002_filtered_info[, c("CXCL9"), drop = F]
+HCI002_filtered_info$CD8T_CM_tripletORp_ratio_baseline <- HCI002_all_info$CD8T_CM_tripletORp_ratio_baseline
+HCI002_filtered_info[[phenotype_name]] <- HCI002_all_info[[phenotype_name]] 
+HCI002_filtered_info$patient_therapy <- HCI002_all_info$patient_therapy
+
+# HCI002 train
+complete_data <- cbind(scale(HCI002_filtered_info[c(1,2)]), HCI002_filtered_info[c(3,4)])
+complete_data <- complete_data[complete.cases(complete_data[c(1,2,3)]), ]
+x_train <-complete_data[, c(1,2),drop=F]
+y_train <- complete_data[, c(3)]
+train_data <- data.frame(y = y_train, x_train)
+logistic_model <- glm(y ~ ., data = train_data, family = "binomial")
+train_predictions <- predict(logistic_model, newdata = x_train, type = "response")
+complete_data$MLpredictor <- train_predictions
+
+all_info_for_plot <- merge(HCI002_all_info[!duplicated(HCI002_all_info$patient_therapy), ], complete_data[!duplicated(complete_data$patient_therapy), c("MLpredictor", "patient_therapy")], by = "patient_therapy", all.x = T)
+
+# Input
+feature_test <- "MLpredictor"
+feature_test_show <- "Score"
+dataset_test <- "HCI002"  
+
+# Predictor
+actCD8TCM_vec <- all_info_for_plot[[feature_test]]
+
+# Categorical (group) variables
+sex_vec <- all_info_for_plot[["Gender"]]
+stage_vec <- all_info_for_plot[["Baseline Stage / TNM"]]
+stage_vec[grepl("IV", stage_vec)] <- 4
+stage_vec[grepl("III", stage_vec)] <- 3
+stage_vec[grepl("II", stage_vec)] <- 2
+stage_vec[grepl("I", stage_vec)] <- 1
+stage_vec <- as.numeric(stage_vec)
+
+ICBnaive_vec <- all_info_for_plot[["ICI Naïve?"]]
+IPIdrug_vec <- all_info_for_plot[["Drug"]]
+BRAFmut_vec <- all_info_for_plot[["BRAF Mutation"]]
+BRAFmut_vec[(!grepl("V600E|V600K|Wildtype", BRAFmut_vec)) & !is.na(BRAFmut_vec)] <- "Other mut."
+BRAFmut_vec[is.na(BRAFmut_vec)] <- "Unknown"
+
+# Continuous variables
+continuous_vars <- list(
+  Age = all_info_for_plot[["Age at C1"]],
+  TMB = all_info_for_plot[["TMB (mutation /mb)"]],
+  PDL1_TPS = all_info_for_plot[["PD-L1 TPS"]],
+  PDL1_CPS = all_info_for_plot[["PD-L1 CPS"]]
+)
+
+continuous_vars_show <- c("Age", "TMB (mut. / Mb)", "PDL1 TPS (%)", "PDL1 CPS (%)")
+
+# Plot correlations: scatter plots for continuous variables
+for (var_name_i in 1:length(continuous_vars)) {
+  var_name <- names(continuous_vars)[var_name_i]
+  var_name_show <- continuous_vars_show[var_name_i]
+  var_vec <- continuous_vars[[var_name]]
+  plot_df <- data.frame(Predictor = actCD8TCM_vec, Variable = var_vec)
+
+  pdf_name <- paste0(result_figure_dir, "scatter_", dataset_test, "_", feature_test, "_vs_", var_name, ".pdf")
+  p <- ggplot(plot_df, aes(x = Variable, y = Predictor)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") +
+    labs(title = "",
+         x = var_name_show,
+         y = feature_test_show) +
+    theme_minimal() +
+      theme(
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white", color = NA),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.line.y = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black")
+      )
+
+  ggsave(pdf_name, plot = p, width = 2.1, height = 2.4)
+}
+
+# Bar plots: categorical variables
+group_vars <- list(
+  Gender = sex_vec,
+  Stage = stage_vec,
+  `ICB naive` = ICBnaive_vec,
+  Drug = IPIdrug_vec,
+  BRAF = BRAFmut_vec
+)
+
+for (var_name in names(group_vars)) {
+  var_vec <- as.factor(group_vars[[var_name]])
+  plot_df <- data.frame(Predictor = actCD8TCM_vec, Group = var_vec)
+
+  pdf_name <- paste0(result_figure_dir, "barplot_", dataset_test, "_", feature_test, "_vs_", var_name, ".pdf")
+  p <- ggplot(plot_df, aes(x = Group, y = Predictor)) +
+    geom_boxplot(outlier.shape = NA, fill = "lightgray", color = "black") +
+    geom_jitter(width = 0.2, size = 1, aes(color = Group)) +
+    labs(title = "",
+         x = var_name,
+         y = feature_test_show) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.border = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.line.x = element_line(color = "black"),
+      axis.line.y = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+      legend.position = "none"
+    )
+  ggsave(pdf_name, plot = p, width = 1.5, height = 3)
+}
+
+### statistical test 
+wilcox_results <- data.frame(Variable = character(), P_value = numeric(), stringsAsFactors = FALSE)
+
+for (var_name in names(group_vars)) {
+  group_vec <- group_vars[[var_name]]
+
+  # Skip if all NA
+  if (all(is.na(group_vec))) next
+
+  # Clean/transform specific variables
+  if (var_name == "Stage") {
+    # Merge stage 2 and 3 → "Mid", stage 4 → "High"
+    group_vec <- ifelse(group_vec %in% c(2, 3), "Mid", 
+                        ifelse(group_vec == 4, "High", NA))
+  } else if (var_name == "BRAF") {
+    # Group Wildtype vs Mutant (non-Wildtype)
+    group_vec <- ifelse(group_vec == "Wildtype", "Wildtype", 
+                        ifelse(!is.na(group_vec), "Mutant", NA))
+  }
+
+  # Remove NAs
+  valid_idx <- !is.na(actCD8TCM_vec) & !is.na(group_vec)
+  vec <- actCD8TCM_vec[valid_idx]
+  grp <- group_vec[valid_idx]
+
+  # Run test only if 2 unique groups
+  if (length(unique(grp)) == 2) {
+    test_result <- wilcox.test(vec ~ grp)
+    p_val <- test_result$p.value
+  } else {
+    p_val <- NA
+  }
+
+  # Save result
+  wilcox_results <- rbind(wilcox_results, data.frame(Variable = var_name, P_value = p_val))
+}
+
+# View results
+print(wilcox_results)
+
+```
+
+# SFigure 6C. Plot AUC comparison of different drug types: IPI vs non-IPI containing, ICB naive vs experienced, stage 4 vs 1-3 (in HCI002)
+```{r}
+
+AUC_subpopulation_df_HCI002 = data.frame(irAE_type = c("PD1/PDL1", "CTLA4-containing", "ICB-naive", "ICB-experienced", "stage I-III", "stage IV", "Active treatment", "Adjuvant"), 
+                          irAE_AUC = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_lower = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          irAE_AUC_upper = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          irAE_pval = c(NA, NA, NA, NA, NA, NA, NA, NA),
+                          sample_size = c(NA, NA, NA, NA, NA, NA, NA, NA))
+
+#### compare AUCs of different subpopulations
+AUC_subpopulation_all_info_df <- all_info_for_plot[c(feature_test, "Drug", "ICI Naïve?", "Baseline Stage / TNM", "IRAEactionable01", "TherapyType")]
+colnames(AUC_subpopulation_all_info_df) <- c("Feature", "Drug", "ICB-naive", "Stage_raw", "Phenotype", "TherapyType")
+AUC_subpopulation_all_info_df$Stage <- "Stage I-III"
+AUC_subpopulation_all_info_df$Stage[grepl("IV", AUC_subpopulation_all_info_df$Stage_raw)] <- "Stage IV"
+AUC_subpopulation_all_info_df$`ICB-naive`[AUC_subpopulation_all_info_df$`ICB-naive` == "Yes"] <- "ICB-naive"
+AUC_subpopulation_all_info_df$`ICB-naive`[AUC_subpopulation_all_info_df$`ICB-naive` == "No"] <- "ICB-experienced"
+AUC_subpopulation_all_info_df$TherapyType[AUC_subpopulation_all_info_df$TherapyType %in% c("Adjuvant")] <- "Adjuvant"
+AUC_subpopulation_all_info_df$TherapyType[AUC_subpopulation_all_info_df$TherapyType %in% c("Neoadjuvant")] <- "Neoadjuvant"
+AUC_subpopulation_all_info_df$TherapyType[AUC_subpopulation_all_info_df$TherapyType %in% c("Active")] <- "Active treatment"
+
+predictor <- AUC_subpopulation_all_info_df$Feature
+response <- AUC_subpopulation_all_info_df$Phenotype
+
+subpopulation_grouping = c("Drug", "ICB-naive", "Stage", "TherapyType")
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+p_vec = c()
+sample_size = c()
+for (sg in subpopulation_grouping){
+  if (sg == "Drug"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "PD1/PDL1"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "CTLA4-containing"
+  }else if (sg == "ICB-naive"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "ICB-naive"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "ICB-experienced"
+  }else if (sg == "Stage"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "Stage I-III"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "Stage IV"
+  }else if (sg == "TherapyType"){
+    index_1 <- AUC_subpopulation_all_info_df[[sg]] == "Active treatment"
+    index_2 <- AUC_subpopulation_all_info_df[[sg]] == "Adjuvant"
+  }
+  roc_obj <- roc(response[index_1], predictor[index_1], direction="<",levels=c(0, 1))
+  AUC_ci <- ci.auc(roc_obj)
+  AUC_vec = c(AUC_vec, AUC_ci[2])
+  AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+  AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  auc_p=roc.area(response[index_1], predictor[index_1])
+  p_val = auc_p$p.value
+  p_vec = c(p_vec, p_val)
+  sample_size = c(sample_size, sum(!(is.na(response[index_1])) & !(is.na(predictor[index_1]))))
+  
+  roc_obj <- roc(response[index_2], predictor[index_2], direction="<",levels=c(0, 1))
+  AUC_ci <- ci.auc(roc_obj)
+  AUC_vec = c(AUC_vec, AUC_ci[2])
+  AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+  AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  auc_p=roc.area(response[index_2], predictor[index_2])
+  p_val = auc_p$p.value
+  p_vec = c(p_vec, p_val)
+  sample_size = c(sample_size, sum(!(is.na(response[index_2])) & !(is.na(predictor[index_2]))))
+}
+AUC_subpopulation_df_HCI002$irAE_AUC = AUC_vec
+AUC_subpopulation_df_HCI002$irAE_AUC_lower = AUC_low_vec
+AUC_subpopulation_df_HCI002$irAE_AUC_upper = AUC_up_vec
+AUC_subpopulation_df_HCI002$irAE_pval = p_vec
+AUC_subpopulation_df_HCI002$sample_size = sample_size
+
+
+#### AUC barplot
+for (test_subgrouping in subpopulation_grouping){
+  if (test_subgrouping == "Drug"){
+    plot_df = AUC_subpopulation_df_HCI002[1:2,]
+  }else if (test_subgrouping == "ICB-naive"){
+    plot_df = AUC_subpopulation_df_HCI002[3:4,]
+  }else if (test_subgrouping == "Stage"){
+    plot_df = AUC_subpopulation_df_HCI002[5:6,]
+  }else if (test_subgrouping == "TherapyType"){
+    plot_df = AUC_subpopulation_df_HCI002[7:8,]
+  }
+  plot_df$irAE_type <- paste0(plot_df$irAE_type, "\n(n=", plot_df$sample_size, ")")
+  
+  # Convert p-values to strings for annotation
+  plot_df <- plot_df %>% 
+    mutate(
+      irAE_pval_str = sapply(irAE_pval, function(p) {
+        if (p == 0) return("p==0")
+        exp10  <- floor(log10(p))
+        coef   <- signif(p / 10^exp10, 2)
+        sprintf("p==%s%%*%%10^%s", coef, exp10)
+      })
+    )
+  
+  # Plot
+  fig_width = 2
+  fig_height = 3.5
+  pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_subgroups_",test_subgrouping,"_HCI002.pdf")) 
+  pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+  p <- ggplot(plot_df, aes(x = irAE_type, y = irAE_AUC, fill = irAE_type)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_errorbar(
+      aes(ymin = irAE_AUC_lower, ymax = irAE_AUC_upper),
+      width = 0.2,              # width of the error bar ends
+      color = "black",          # color of the error bars
+      linewidth = 0.5
+      ) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+    labs(title = "", x = "", y = "AUC") +
+    ylim(0, 1) + 
+    theme(panel.grid = element_blank(), 
+          panel.background = element_rect(fill = "white"),
+          axis.line.y = element_line(color = "black"),
+          axis.line.x = element_line(color = "black"),
+          axis.ticks.y = element_line(color = "black"),
+          axis.ticks.x = element_line(color = "black"),
+          axis.text.y = element_text(color = "black"),
+          axis.text.x = element_text(color = "black", angle = 47, hjust = 1),
+          panel.border = element_blank(), legend.position = "none") +
+    guides(color = guide_legend(override.aes = list(size = 5), nrow = 1)) 
+  print(p) 
+  dev.off()
+}
+
+```
+
+# SFigure 6D. logistic regression model predicts irAE subtypes
+```{r}
+
+test_cohort <- "HCI002"
+
+######################## HCI002 ########################
+phenotype_df_HCI002 = HCI002_all_info[,phenotype_name, drop = F]
+HCI002_filtered_info = HCI002_all_info[grepl("OLINK_baseline$", colnames(HCI002_all_info), ignore.case = T)] 
+colnames(HCI002_filtered_info) <- gsub("_OLINK_baseline", "", colnames(HCI002_filtered_info))
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)  # Named vector: OlinkID -> gene symbol
+colnames(HCI002_filtered_info) <- proteins_mapping[colnames(HCI002_filtered_info)]
+HCI002_filtered_info <- HCI002_filtered_info[, !duplicated(colnames(HCI002_filtered_info))]
+HCI002_filtered_info <- HCI002_filtered_info[, c("CXCL9"), drop = F]
+HCI002_filtered_info$CD8T_CM_tripletORp_ratio_baseline <- HCI002_all_info$CD8T_CM_tripletORp_ratio_baseline
+HCI002_filtered_info[[phenotype_name]] <- HCI002_all_info[[phenotype_name]] 
+HCI002_filtered_info$patient_therapy <- HCI002_all_info$patient_therapy
+
+# HCI002 train
+complete_data <- cbind(scale(HCI002_filtered_info[c(1,2)]), HCI002_filtered_info[c(3,4)])
+complete_data <- complete_data[complete.cases(complete_data[c(1,2,3)]), ]
+x_train <-complete_data[, c(1,2),drop=F]
+y_train <- complete_data[, c(3)]
+train_data <- data.frame(y = y_train, x_train)
+logistic_model <- glm(y ~ ., data = train_data, family = "binomial")
+train_predictions <- predict(logistic_model, newdata = x_train, type = "response")
+complete_data$MLpredictor <- train_predictions
+
+## load phenotype information
+pheno_df <- HCI002_all_info0[c("patient_therapy", "IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", "irAE Overall Assessment")]
+pheno_df <- pheno_df[!duplicated(pheno_df$patient_therapy), ]
+pheno_all_info_HCI002 <- merge(complete_data, pheno_df, by = "patient_therapy", x.all = T)
+
+pheno_all_info <- pheno_all_info_HCI002
+
+## AUCs of diffferent irAE subtypes
+AUC_irAEs_df = data.frame(irAE_type = c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01"),
+                          irAE_AUC = c(NA, NA, NA, NA),
+                          irAE_AUC_lower = c(NA, NA, NA, NA),
+                          irAE_AUC_upper = c(NA, NA, NA, NA),
+                          irAE_pval = c(NA, NA, NA, NA))
+phenotype_vec = c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01")
+AUC_vec = c()
+AUC_low_vec = c()
+AUC_up_vec = c()
+p_vec = c()
+
+pt <- phenotype_vec[1]
+for (pt in phenotype_vec){
+  response <- pheno_all_info[[pt]] 
+  predictor <- pheno_all_info$MLpredictor # CD8T_CM_tripletORp_ratio_baseline MLpredictor
+  roc_obj <- roc(response, predictor, direction="<",levels=c(0, 1))
+  AUC_ci <- ci.auc(roc_obj)
+  AUC_vec <- c(AUC_vec, AUC_ci[2])
+  AUC_low_vec <- c(AUC_low_vec, AUC_ci[1])
+  AUC_up_vec <- c(AUC_up_vec, AUC_ci[3])
+  auc_p=roc.area(response, predictor)
+  p_val <- auc_p$p.value
+  p_vec <- c(p_vec, p_val)
+}
+AUC_irAEs_df$irAE_AUC = AUC_vec
+AUC_irAEs_df$irAE_AUC_lower = AUC_low_vec
+AUC_irAEs_df$irAE_AUC_upper = AUC_up_vec
+AUC_irAEs_df$irAE_pval = p_vec
+
+plot_df <- AUC_irAEs_df
+# Convert p-values to strings for annotation
+plot_df <- plot_df %>% 
+  mutate(
+    irAE_pval_str = sapply(irAE_pval, function(p) {
+      if (p == 0) return("p==0")
+      exp10  <- floor(log10(p))
+      coef   <- signif(p / 10^exp10, 2)
+      sprintf("p==%s%%*%%10^%s", coef, exp10)
+    })
+  )
+# Filter to selected irAE types
+selected_types <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01")
+plot_df <- plot_df[plot_df$irAE_type %in% selected_types, ]
+# Define mapping as a named vector
+mapping <- c(
+  "IRAE_GI01"  = "Gastrointestinal",
+  "IRAE_HB01"  = "Hepatobiliary",
+  "IRAE_skin01" = "Skin",
+  "IRAE_MSK01"  = "Musculoskeletal"
+)
+# Apply mapping to irAE_type
+plot_df$irAE_type <- mapping[plot_df$irAE_type]
+
+
+
+# Plot
+fig_width = 2
+fig_height = 3.5
+pdf_file <- paste0(result_figure_dir,paste0("barplot_AUC_compare_irAE_types_",test_cohort,"_IntegrateML.pdf")) 
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(plot_df, aes(x = irAE_type, y = irAE_AUC, fill = irAE_type)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_errorbar(
+    aes(ymin = irAE_AUC_lower, ymax = irAE_AUC_upper),
+    width = 0.2,              # width of the error bar ends
+    color = "black",          # color of the error bars
+    linewidth = 0.5
+    ) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
+  labs(title = "", x = "", y = "AUC") +
+  ylim(0, 1) + 
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        axis.ticks.y = element_line(color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black", angle = 47, hjust = 1),
+        panel.border = element_blank(), legend.position = "none") +
+  guides(color = guide_legend(override.aes = list(size = 5), nrow = 1)) 
+dev.off()
+
+```
+
+# SFigure 6B. Integrated signature predicts irAE grades
+```{r}
+plot_df <- data.frame(group = pheno_all_info_HCI002$`irAE Overall Assessment`,
+                      value = pheno_all_info_HCI002$MLpredictor)
+plot_df$group <- factor(plot_df$group, levels = c("None", "Mild", "Moderate", "Severe"))
+
+# Plot
+fig_width = 2
+fig_height = 3
+pdf_file <- paste0(result_figure_dir,paste0("boxplot_AUC_compare_irAE_groups_HCI002_IntegrateML.pdf")) 
+pdf(pdf_file, onefile=FALSE, width = fig_width,height=fig_height)
+ggplot(plot_df, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, color = "black") +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
+  labs(x = "", y = "Score") +
+  ylim(0,1) +
+  theme(panel.grid = element_blank(), 
+      panel.background = element_rect(fill = "white"),
+      axis.line.y = element_line(color = "black"),
+      axis.line.x = element_line(color = "black"),
+      axis.ticks.y = element_line(color = "black"),
+      axis.ticks.x = element_line(color = "black"),
+      axis.text.y = element_text(color = "black"),
+      axis.text.x = element_text(color = "black", angle = 47, hjust = 1),
+      panel.border = element_blank(), legend.position = "none")
+dev.off()
+
+wilcox.test(plot_df$value[plot_df$group == "Severe"], plot_df$value[plot_df$group != "Severe"])
+
+```
+
