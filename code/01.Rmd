@@ -22,7 +22,7 @@ source("utils.R")
 ## SFigure 4A-B
 
 
-# Figure 1A-B (middle and right panels). UMAP and heatmap.
+# Figure 1A-B
 ```{r}
 
 set.seed(1)
@@ -75,8 +75,7 @@ HCI001_map_df <- read.csv(file.path(data_dir, "HCI001_OlinkID_ProteinName_map.cs
 
 ```
 
-
-# Figure 1C. Pie plots.
+# Figure 1C. 
 ```{r}
 empty_names <- is.na(names(HCI002_all_info0)) | names(HCI002_all_info0) == ""
 names(HCI002_all_info0)[empty_names] <- paste0("unnamed_col_", which(empty_names))
@@ -114,7 +113,7 @@ plot_pie(data.frame(Category = c("Female (n = 63)", "Male (n = 96)"), Count = c(
 
 ```
 
-# Figure 1D. Severe-irAE subtype bar plots.
+# Figure 1D. 
 ```{r}
 all_info <- all_info %>%
   mutate(
@@ -154,7 +153,7 @@ save_pdf(print(p_subtype), file.path(result_figure_dir, "barplot_severe_irAE_sub
 
 ```
 
-# Figure 1D. Categorical associations with severe irAE.
+# Figure 1D. 
 ```{r}
 clinical_df <- data.frame(
   PDL1 = all_info$`PD-L1 CPS`,
@@ -192,14 +191,14 @@ plot_binary_rate(
 
 ```
 
-# Figure 1D. Age/TMB vs severe irAE group box plots.
+# Figure 1D. 
 ```{r}
 plot_continuous_by_irae(all_info, "Age at C1", "Age (years)", "boxplot_age_vs_irAE.pdf", width = 1.2*1.1, height = 2.5)
 plot_continuous_by_irae(all_info, "TMB (mutation /mb)", "TMB (mut. / Mb)", "boxplot_TMB_vs_irAE.pdf", width = 1.2*1.1, height = 2.5)
 
 ```
 
-# Figure 1E and SFigure 4A-B. Kaplan–Meier survival curves.
+# Figure 1E and SFigure 4A-B. 
 ```{r}
 survival_info_df0 <- read_cohort("HCI002_info_save.csv")
 

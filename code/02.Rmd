@@ -32,7 +32,7 @@ HCI002_map_df <- read.csv(data_path("HCI002_OlinkID_ProteinName_map.csv"))
 
 ```
 
-# SFigure 5A-D. Box plots.
+# SFigure 5A-D.
 ```{r}
 phenotype_grouping <- "IRAEactionable01"
 
@@ -161,7 +161,7 @@ for (population_name in names(cell_population_specs)) {
 
 ```
 
-# Supplementary Table 8. 
+# STable 8. 
 ```{r} 
 phenotype_name <- "IRAEactionable01"
 feature_df <- HCI002_all_info[20:25891]
@@ -245,7 +245,7 @@ write.xlsx(df_list, file = data_path("TableS8.xlsx"), rowNames = TRUE)
 
 ```
 
-# Figure 2A,C,E/SFigure 10A,C,E. Volcano plots.
+# Figure 2A,C,E/SFigure 10A,C,E.
 ```{r}
 plot_volcano_panel <- function(result_df, phenotype_name, metric, time_point, modality, map_df, ymax = 10, seed = 1) {
   metric_col <- paste0(phenotype_name, "_", metric)
@@ -357,7 +357,7 @@ for (phenotype_name in phenotype_names_vec) {
 
 ```
 
-# Figure 2B,D,F/Figure 4A/SFigure 10B,D,F. Venn plots.
+# Figure 2B,D,F/Figure 4A/SFigure 10B,D,F.
 ```{r}
 
 phenotype_name <- "IRAEactionable01"
@@ -454,7 +454,7 @@ Feature_neg_FC_on_pre_common <- venn_results$FC_on_pre$neg_common
 
 ```
 
-# Figure 4B/SFigure 10G. Pathway enrichment plots.
+# Figure 4B/SFigure 10G.
 ```{r}
 get_enrichment_df <- function(enrich_result, id_map, pathway_map = NULL, direction = "Positive") {
   result <- enrich_result@result

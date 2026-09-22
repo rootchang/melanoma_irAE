@@ -56,7 +56,7 @@ datasets <- lapply(datasets, make_severe_irAE, out_col = pheno_feat)
 ```
 
 
-# Figure 3C (phenotype_type = "actionable") and SFigure 14A (right; phenotype_type = "conventional"). SFigure 15A.
+# Figure 3C. SFigure 14A (right; phenotype_type = "conventional"). SFigure 15A.
 ```{r}
 
 HCI002_data <- datasets$HCI002
@@ -128,7 +128,7 @@ for (phenotype_type in c('actionable', 'conventional', 'any', 'drop_mild')) {
 ```
 
 
-# Figure 4F. AUC bar plots for Olink features (fold change of proteins as predictors of severe irAE). SFigure 14B (right; phenotype_type = "conventional"). SFigure 15B.
+# Figure 4F. SFigure 14B (right; phenotype_type = "conventional"). SFigure 15B.
 ```{r}
 
 HCI002_data <- datasets$HCI002
@@ -226,7 +226,7 @@ for (phenotype_type in c('actionable', 'conventional', 'any', 'drop_mild')) {
 ```
 
 
-# Figure 3I,J. Odds ratio barplots.
+# Figure 3I,J. 
 ```{r}
 
 external_datasets <- list(
@@ -275,7 +275,7 @@ print(paste(dataset_name, "OR:", or_value))
 ```
 
 
-# Figure 3K. Forest plot of OS hazard ratios across Switzerland cohorts
+# Figure 3K. 
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
@@ -401,7 +401,7 @@ result_df
 ```
 
 
-# Figure 5B,D. Feature importance and Odds ratio bar plots of the LR model.
+# Figure 5B,D. 
 ```{r}
 
 HCI002_data <- datasets$HCI002
@@ -736,7 +736,7 @@ region_summary
 
 ```
 
-# SFigure 14C (left) (phenotype_type = "conventional"). ROC plots, box plots, bar plots.
+# SFigure 14C (left; phenotype_type = "conventional"). 
 ```{r}
 main_feature <- "integrated"
 
@@ -773,7 +773,7 @@ for (phenotype_type in phenotype_types) {
 
 ```
 
-# SFigure 16C. Performance on HCI001/HCI002 with a fixed cutoff of integrated_pre
+# SFigure 16C. 
 ```{r}
 
 main_feature <- "integrated"
@@ -841,7 +841,7 @@ for (phenotype_type in phenotype_types) {
 ```
 
 
-# Figure 5C (phenotype_type = "actionable") and SFigure 14C (right; phenotype_type = "conventional") AUC comparison between Integrated ML vs other signatures (across 5 datasets). SFigure 15C.
+# Figure 5C (phenotype_type = "actionable"). SFigure 14C (right; phenotype_type = "conventional"). SFigure 15C.
 ```{r}
 
 HCI002_data_temp <- datasets$HCI002
@@ -967,7 +967,7 @@ for (phenotype_type in c('actionable', 'conventional', 'any', 'drop_mild')) {
 ```
 
 
-# Figure 5E and SFigure 12F. Survival analysis.
+# Figure 5E. SFigure 12F. 
 ```{r}
 make_survival_df <- function(df, score_col = "integrated", high_rule = c(">=", ">")) {
   high_rule <- match.arg(high_rule)
@@ -1034,7 +1034,7 @@ for (cohort_type in c("Pooled", "HCI002")) {
 ```
 
 
-# Figure 5F. Multivariable Cox regression forest plots for OS and PFS in HCI002
+# Figure 5F.
 ```{r}
 test_var <- "integrated"
 test_var_label <- "Integrated"
@@ -1165,7 +1165,7 @@ save_forest_plot(
 result_df
 ```
 
-# SFigure 9A. Pooled analysis (Odds ratio barplot, K-M curves). 
+# SFigure 9A. 
 ```{r}
 
 main_feature <- "CD8T_CM_tripletORp_ratio_pre" 
@@ -1269,7 +1269,7 @@ save_irAE_barplot2(plot_data, paste0("barplot_pooled.pdf"), width = 1.2*1.2, hei
 
 ```
 
-# SFigure 13A,B. revision for Pooled analysis (Odds ratio barplot)  for CXCL9 and aCD8Tcm, PD1 vs CTLA4 subgroup analysis
+# SFigure 13A,B. 
 ```{r}
 ########## for revision  (odds ratio pooled analysis)
 drug <- "CTLA4-containing" # "CTLA4-containing" "PD1/PDL1"
@@ -1306,7 +1306,7 @@ save_irAE_barplot2(plot_data, paste0("barplot_pooled_", drug_name, "_CXCL9FC.pdf
 ```
 
 
-# SFigure 13C. pooled analaysis of integrated sig. include PD1 vs CTLA4 subgroup analysis
+# SFigure 13C.
 ```{r}
 
 main_feature <- "integrated"
@@ -1344,7 +1344,7 @@ save_irAE_barplot2(plot_data, paste0("barplot_pooled_", drug_name, "_ML.pdf"), w
 ```
 
 
-# STable9. Subgroup analysis summary table
+# STable9. 
 ```{r}
 
 main_feature <- "CD8T_CM_tripletORp_ratio_pre"
@@ -1520,7 +1520,7 @@ feature_test <- "integrated"
 ```
 
 
-# SFigure 12A. Integrated score across irAE severity groups.
+# SFigure 12A. 
 ```{r}
 plot_df <- pheno_all_info_HCI002 %>%
   transmute(
@@ -1559,7 +1559,7 @@ wilcox.test(
 )
 ```
 
-# SFigure 12B. AUC comparison across HCI002 clinical subgroups.
+# SFigure 12B. 
 ```{r}
 compute_auc_summary <- function(df, predictor_col, outcome_col = "Phenotype") {
   auc_df <- df %>%
@@ -1659,7 +1659,7 @@ for (group_col in names(subgroup_specs)) {
 
 ```
 
-# SFigure 12C. Integrated model AUC across irAE subtypes.
+# SFigure 12C. 
 ```{r}
 irae_subtypes <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01")
 
@@ -1700,7 +1700,7 @@ print(p)
 dev.off()
 ```
 
-# SFigure 12D,E. Association between integrated score and baseline clinical variables in HCI002.
+# SFigure 12D,E. 
 ```{r}
 plot_df <- pheno_all_info_HCI002 %>%
   transmute(

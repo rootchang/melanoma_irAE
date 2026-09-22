@@ -39,7 +39,7 @@ HCI002_all_info <- HCI002_all_info %>%
 HCI002_map_df <- read.csv(data_path("HCI002_OlinkID_ProteinName_map.csv"))
 ```
 
-# Figure 4C. Heatmap (of Olink protein fold-change).
+# Figure 4C. 
 ```{r}
 map_olink_features <- function(feature_df, time_point, map_df) {
   olink_df <- feature_df[grepl(paste0("OLINK_", time_point), colnames(feature_df))]
@@ -183,7 +183,7 @@ dev.off()
 
 ```
 
-# Figure 4G. Heatmap (of AUCs).
+# Figure 4G. 
 ```{r}
 
 plot_df <- read.csv(paste0(data_dir, "HCI002_AUCs_irAE_subtypes.csv"))
@@ -236,7 +236,7 @@ dev.off()
 
 ```
 
-# Figure 4D. AUC comparison of selected Olink proteins across time points in HCI002
+# Figure 4D. 
 ```{r}
 proteins_test <- c("CXCL9", "CA6")
 timepoints <- c("baseline", "ontreat", "FC_on_pre")
@@ -382,7 +382,7 @@ dev.off()
 
 ```
 
-# Figure 4E. Severe-irAE-free survival by CXCL9 fold-change in HCI002
+# Figure 4E. 
 ```{r}
 feature_col <- "CXCL9_FC"
 

@@ -65,7 +65,7 @@ HCI001_all_info <- HCI001_all_info %>%
 
 ```
 
-# Figure 3A,B (phenotype_type = "actionable") and SFigure 14A (left) (phenotype_type = "conventional"). ROC plots, box plots, bar plots.
+# Figure 3A,B. SFigure 14A (left).
 ```{r}
 main_feature <- "CD8T_CM_tripletORp_ratio_pre"
 
@@ -378,7 +378,7 @@ OLINK_FC_data <- extract_olink(
 
 ```
 
-# SFigure 4C,D. Within-modality correlation heatmaps.
+# SFigure 4C,D. 
 ```{r}
 cytof_markers <- c(
   "T_CELL", "GDT", "B_CELL", "B_NAIVE", "B_MEM", "PB", "NK", "MONO", "DC",
@@ -468,7 +468,7 @@ common_gene <- intersect(genes_in_cluster1$Pre, genes_in_cluster1$On)
 
 ```
 
-# SFigure 10H (upper). Venn plot.
+# SFigure 10H (upper). 
 ```{r}
 venn_plot <- draw.pairwise.venn(
   area1 = length(genes_in_cluster1$Pre),
@@ -491,7 +491,7 @@ save_pdf(
 
 ```
 
-# SFigure 10H (lower). AUCs for common proteins.
+# SFigure 10H (lower).
 ```{r}
 phenotype_vec <- HCI002_all_info$IRAEactionable01
 
@@ -541,7 +541,7 @@ save_pdf(
 
 ```
 
-# Figure 3D. CyTOF–Olink correlation heatmap.
+# Figure 3D.
 ```{r}
 major_celltypes <- c(
   "T_CELL", "GDT", "B_CELL", "B_NAIVE", "B_MEM", "PB", "NK", "MONO", "DC",
@@ -609,7 +609,7 @@ save_pdf(
 
 ```
 
-# Figure 3E. AUC heatmap of baseline cytometric predictors across irAE subtypes
+# Figure 3E.
 ```{r}
 cytometry_predictors <- c(
   "CD8T_CM_tripletORp_ratio_pre",
@@ -744,7 +744,7 @@ dev.off()
 
 ```
 
-# Figure 3F. Activated CD8Tcm abundance across irAE and ICB response groups in HCI002
+# Figure 3F.
 ```{r}
 group_levels <- c("nsTOX,R", "nsTOX,NR", "sTOX,R", "sTOX,NR")
 
@@ -815,7 +815,7 @@ wilcox_results
 
 ```
 
-# Figure 3G/SFigure 6D,E. HCI002 survival analysis by cytometric predictors
+# Figure 3G/SFigure 6D,E.
 ```{r}
 feature_test_vec <- c(
   "CD8T_CM_tripletORp_ratio_pre")
@@ -971,7 +971,7 @@ survival_results
 ```
 
 
-# Figure 3H. Multivariable Cox regression forest plots in HCI002
+# Figure 3H. 
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
@@ -1079,7 +1079,7 @@ AUC_irAEs_df_HCI001 <- compute_irae_auc_table(HCI001_all_info, feature_col, irae
 ```
 
 
-# SFigure 6A. AUC comparison across irAE subtypes
+# SFigure 6A. 
 ```{r}
 irae_label_map <- c(
   IRAE_GI01 = "Gastrointestinal",
@@ -1112,7 +1112,7 @@ for (dataset_name in names(auc_dataset_list)) {
 
 ```
 
-# SFigure 6C. Association between activated CD8Tcm abundance and baseline clinical variables in HCI002
+# SFigure 6C.
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 feature_label <- "% activated CD8Tcm"
@@ -1199,7 +1199,7 @@ wilcox_results
 
 ```
 
-# SFigure 6B. AUC comparison across clinical subgroups in HCI002
+# SFigure 6B.
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
