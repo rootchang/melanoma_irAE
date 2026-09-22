@@ -1,6 +1,6 @@
 ---
 title: "Cytometric and Integrated biomarker analysis across immunotherapy cohorts"
-author: "Tiangen Chang"
+author: "Tiangen Chang <tiangen.chang@sjtu.edu.cn>"
 output:
   rmarkdown::html_vignette:
     toc: true
@@ -13,361 +13,24 @@ vignette: >
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, results = "markup", warning = FALSE, message = FALSE)
+source("utils.R")
 ```
 
 ####### This script makes the below displays for the paper
-## Figure 3c, i-n
-## Figure 4f
-## Figure 5b-f
-## SFigure 5c-e
-## SFigure 7a-f
+## Figure 3C, I-K
+## Figure 4F
+## Figure 5B-F
+## SFigure 9A
+## SFigure 11
+## SFigure 12
+## SFigure 13
+## SFigure 14A,B,C (right)
+## SFigure 15
+## SFigure 16C
+## SFigure 17
+## STables 9-11
 
-# load required package
-```{r}
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(ggpubr)
-library(pROC)
-library(survival)
-library(survminer)
-library(broom)
-library(grid)
-library(forestplot)
-library(readxl)
 
-```
-
-# Set parameters and directories
-```{r}
-result_figure_dir <- "./Figures/"
-data_dir <- "./SourceData/merged_cohorts/"
-result_data_dir <- data_dir
-
-pheno_feat <- "severe_irAE"
-
-sig_feats <- c(
-  "CD8T_CM_tripletORp_ratio_pre",
-  "CXCL9_pre"
-)
-
-other_feats <- c(
-  "CD8T_KI67p_ratio_pre",
-  "CD4T_KI67p_ratio_pre",
-  "Treg_KI67p_ratio_pre",
-  "CD4TM_tripletORp_ratio_pre",
-  "CD8T_EMRA_CD38p_ratio_pre",
-  "CD4T_EM_tripletORp_ratio_pre",
-  "CD4T_EM_ratio_pre",
-  "CD4T_Naive_ratio_pre",
-  "CXCL9_pre",
-  "CXCL10_pre",
-  "CXCL11_pre",
-  "IFNG_pre"
-)
-
-all_feats <- unique(c(sig_feats, other_feats))
-
-dataset_colors <- c(
-  "#1c4f27", "#81144e", "#79831e", "#00305d", "#9c1915",
-  "black", "grey", "#f58231", "#e6194b", "#3cb44b", "#42d4f4"
-)
-
-```
-
-## Reusable functions
-```{r}
-
-read_cohort <- function(file, melanoma_only = FALSE) {
-  df <- read.csv(file.path(data_dir, file), stringsAsFactors = FALSE)
-  if (melanoma_only && "Cancer" %in% colnames(df)) {
-    df <- df[df$Cancer == "Melanoma", , drop = FALSE]
-  }
-  df
-}
-
-ensure_feats <- function(df, feats) {
-  missing_feats <- setdiff(feats, colnames(df))
-  if (length(missing_feats) > 0) df[missing_feats] <- NA
-  df
-}
-
-make_severe_irAE <- function(df, grade_col = "irAE_grade", out_col = "severe_irAE") {
-  if (!grade_col %in% colnames(df)) stop(sprintf("Column '%s' not found.", grade_col))
-  grade <- suppressWarnings(as.numeric(df[[grade_col]]))
-  df[[out_col]] <- ifelse(is.na(grade), NA, ifelse(grade >= 3, 1, 0))
-  df
-}
-
-set_irAE_outcome <- function(df, phenotype_type) {
-  if (phenotype_type == "actionable") {
-    df$severe_irAE <- df$IRAEactionable01
-  } else if (phenotype_type == "conventional") {
-    df <- make_severe_irAE(df, out_col = "severe_irAE")
-  } else {
-    stop("phenotype_type must be 'actionable' or 'conventional'.")
-  }
-  df
-}
-
-zscore_feats <- function(df, feats) {
-  for (feat in feats) {
-    if (!feat %in% colnames(df)) next
-    x <- suppressWarnings(as.numeric(df[[feat]]))
-    s <- sd(x, na.rm = TRUE)
-    m <- mean(x, na.rm = TRUE)
-    df[[feat]] <- if (all(is.na(x)) || is.na(s) || s == 0) NA_real_ else (x - m) / s
-  }
-  df
-}
-
-fit_logistic <- function(df, y_col, x_cols) {
-  model_df <- df %>%
-    select(all_of(c(y_col, x_cols))) %>%
-    mutate(across(all_of(x_cols), ~ suppressWarnings(as.numeric(.)))) %>%
-    filter(!is.na(.data[[y_col]])) %>%
-    drop_na(all_of(x_cols)) %>%
-    mutate(!!y_col := as.numeric(.data[[y_col]]))
-
-  if (nrow(model_df) < 10) stop("Too few complete cases to fit the model.")
-
-  glm(
-    as.formula(paste(y_col, "~", paste(x_cols, collapse = " + "))),
-    data = model_df,
-    family = binomial()
-  )
-}
-
-predict_auc <- function(model, df, y_col, x_cols) {
-  model_df <- df %>%
-    select(all_of(c(y_col, x_cols))) %>%
-    mutate(across(all_of(x_cols), ~ suppressWarnings(as.numeric(.)))) %>%
-    filter(!is.na(.data[[y_col]])) %>%
-    drop_na(all_of(x_cols)) %>%
-    mutate(!!y_col := as.numeric(.data[[y_col]]))
-
-  if (nrow(model_df) == 0) return(list(pred = numeric(0), auc = NA_real_))
-
-  pred <- as.numeric(predict(model, newdata = model_df, type = "response"))
-  y <- model_df[[y_col]]
-
-  auc_val <- if (length(unique(y)) < 2) {
-    NA_real_
-  } else {
-    as.numeric(pROC::roc(y, pred, direction = "<", levels = c(0, 1), quiet = TRUE)$auc)
-  }
-
-  list(pred = pred, auc = auc_val)
-}
-
-add_model_prediction <- function(df, y_col, x_cols, model, out_col = "integrated") {
-  pred_df <- df %>%
-    mutate(across(all_of(x_cols), ~ suppressWarnings(as.numeric(.)))) %>%
-    mutate(.y = suppressWarnings(as.numeric(.data[[y_col]])))
-
-  valid <- !is.na(pred_df$.y) &
-    apply(pred_df[, x_cols, drop = FALSE], 1, function(x) all(!is.na(x)))
-
-  df[[out_col]] <- NA_real_
-  if (any(valid)) {
-    df[[out_col]][valid] <- as.numeric(predict(model, newdata = pred_df[valid, , drop = FALSE], type = "response"))
-  }
-
-  df
-}
-
-compute_single_feature_auc <- function(df, y_col, feature_col) {
-  auc_df <- df %>%
-    select(all_of(c(y_col, feature_col))) %>%
-    filter(!is.na(.data[[y_col]])) %>%
-    drop_na()
-
-  if (nrow(auc_df) < 10 || length(unique(auc_df[[y_col]])) < 2) return(NA_real_)
-
-  y <- as.numeric(auc_df[[y_col]])
-  x <- suppressWarnings(as.numeric(auc_df[[feature_col]]))
-
-  as.numeric(pROC::roc(y, x, direction = "<", levels = c(0, 1), quiet = TRUE)$auc)
-}
-
-prepare_binary_plot_data <- function(df, feature_col, outcome_col = "severe_irAE") {
-  df %>%
-    select(feature = all_of(feature_col), phenotype = all_of(outcome_col)) %>%
-    drop_na() %>%
-    mutate(
-      group = factor(ifelse(feature <= median(feature, na.rm = TRUE), "Low", "High"), levels = c("Low", "High")),
-      phenotype_label = factor(phenotype, levels = c(0, 1), labels = c("No severe irAE", "Severe irAE"))
-    )
-}
-
-calc_group_rate_or <- function(plot_data) {
-  rates <- aggregate(
-    phenotype ~ group,
-    data = plot_data,
-    FUN = function(x) mean(as.numeric(x) == 1) * 100
-  )
-
-  odds_high <- rates$phenotype[2] / (100 - rates$phenotype[2])
-  odds_low <- rates$phenotype[1] / (100 - rates$phenotype[1])
-  list(rates = rates, or = round(odds_high / odds_low, 1))
-}
-
-save_irAE_barplot <- function(plot_data, file_name, width = 1.5 * 0.95, height = 2.7 * 0.95) {
-  stat <- calc_group_rate_or(plot_data)
-
-  p <- ggplot(stat$rates, aes(x = group, y = phenotype, fill = group)) +
-    geom_bar(stat = "identity", color = "black", width = 0.6) +
-    labs(x = NULL, y = "Severe irAE (%)") +
-    ylim(0, 100) +
-    theme_classic() +
-    theme(
-      axis.text = element_text(color = "black"),
-      legend.position = "none"
-    ) +
-    geom_segment(aes(x = 1, xend = 2, y = 90, yend = 90), linewidth = 0.4) +
-    geom_segment(aes(x = 1, xend = 1, y = 90, yend = 86), linewidth = 0.4) +
-    geom_segment(aes(x = 2, xend = 2, y = 90, yend = 86), linewidth = 0.4) +
-    annotate("text", x = 1.5, y = 97, label = paste0("OR = ", stat$or), size = 3)
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = width, height = height)
-  print(p)
-  dev.off()
-
-  invisible(stat$or)
-}
-
-save_feature_boxplot <- function(plot_data, file_name) {
-  p_val <- wilcox.test(feature ~ phenotype_label, data = plot_data)$p.value
-
-  p <- ggplot(plot_data, aes(x = phenotype_label, y = feature * 100, fill = phenotype_label)) +
-    geom_jitter(aes(color = phenotype_label), width = 0.2, size = 2) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.5, color = "black") +
-    scale_color_manual(values = c("blue", "brown")) +
-    scale_fill_manual(values = c("blue", "brown")) +
-    labs(x = NULL, y = "% activated CD8Tcm / CD8Tcm") +
-    ylim(0, 90) +
-    theme_classic() +
-    theme(
-      axis.text = element_text(color = "black"),
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      legend.position = "none"
-    ) +
-    geom_signif(
-      comparisons = list(c("No severe irAE", "Severe irAE")),
-      annotations = paste0("p = ", signif(p_val, 2)),
-      textsize = 4,
-      y_position = 80,
-      vjust = -0.5,
-      tip_length = 0.05
-    )
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = 1.5, height = 3.3)
-  print(p)
-  dev.off()
-}
-
-save_roc_plot <- function(plot_data, file_name) {
-  roc_obj <- pROC::roc(
-    response = plot_data$phenotype,
-    predictor = plot_data$feature,
-    levels = c(0, 1),
-    direction = "<",
-    quiet = TRUE
-  )
-
-  auc_ci <- pROC::ci.auc(roc_obj)
-  label <- sprintf("AUC = %.2f (%.2f,%.2f)", auc_ci[2], auc_ci[1], auc_ci[3])
-
-  roc_df <- data.frame(
-    fpr = 1 - roc_obj$specificities,
-    sensitivity = roc_obj$sensitivities
-  ) %>%
-    arrange(fpr, sensitivity) %>%
-    distinct()
-
-  p <- ggplot(roc_df, aes(x = fpr, y = sensitivity)) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray70") +
-    geom_step(direction = "vh", color = "black", linewidth = 1) +
-    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
-    labs(x = "1 - Specificity", y = "Sensitivity") +
-    annotate("text", x = 0.17, y = 0.1, hjust = 0, label = label, size = 4) +
-    theme_classic() +
-    theme(axis.text = element_text(color = "black"))
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = 2.7, height = 2.2)
-  print(p)
-  dev.off()
-}
-
-upper_ci95 <- function(y) {
-  y <- y[is.finite(y)]
-  n <- length(y)
-  m <- mean(y)
-  if (n <= 1) return(data.frame(y = m, ymin = m, ymax = m))
-  data.frame(y = m, ymin = m, ymax = m + sd(y) / sqrt(n))
-}
-
-recode_dataset_names <- function(x) {
-  dplyr::recode(
-    x,
-    HCI002 = "HCI002 (CyTOF)",
-    HCI001 = "HCI001 (CyTOF)",
-    Nicolas_FACS = "Nunez 1 (FACS)",
-    Nicolas_CyTOF = "Nunez 1 (CyTOF)",
-    Nicolas_CyTEK = "Nunez 2 (CyTEK)"
-  )
-}
-
-save_auc_comparison <- function(auc_df, selected_features, labels, file_name, width, height) {
-  plot_df <- auc_df[, selected_features, drop = FALSE]
-  colnames(plot_df) <- labels
-  plot_df["Mean", ] <- colMeans(plot_df, na.rm = TRUE)
-  plot_df <- plot_df[, order(as.numeric(plot_df["Mean", ])), drop = FALSE]
-
-  plot_long <- plot_df[setdiff(rownames(plot_df), "Mean"), , drop = FALSE] %>%
-    tibble::rownames_to_column("Dataset") %>%
-    pivot_longer(-Dataset, names_to = "GeneSignature", values_to = "AUC") %>%
-    mutate(
-      Dataset = factor(
-        recode_dataset_names(Dataset),
-        levels = c("HCI001 (CyTOF)", "HCI002 (CyTOF)", "Nunez 1 (FACS)", "Nunez 1 (CyTOF)", "Nunez 2 (CyTEK)")
-      )
-    )
-
-  signature_order <- plot_long %>%
-    group_by(GeneSignature) %>%
-    summarize(mean_auc = mean(AUC, na.rm = TRUE), .groups = "drop") %>%
-    arrange(mean_auc) %>%
-    pull(GeneSignature)
-
-  p <- ggplot(plot_long, aes(x = GeneSignature, y = AUC)) +
-    stat_summary(fun = mean, geom = "col", width = 0.65, fill = "grey85", color = "black", linewidth = 0.35) +
-    stat_summary(fun.data = upper_ci95, geom = "errorbar", width = 0.18, linewidth = 0.35, color = "black") +
-    geom_point(aes(color = Dataset, group = Dataset), position = position_dodge(width = 0.55), size = 2, alpha = 0.95) +
-    scale_x_discrete(limits = signature_order) +
-    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey60", linewidth = 0.4) +
-    labs(x = NULL, y = "AUC") +
-    coord_cartesian(ylim = c(0, 1)) +
-    scale_y_continuous(breaks = seq(0, 1, 0.1), expand = expansion(mult = c(0, 0.02))) +
-    scale_color_manual(values = dataset_colors, name = "") +
-    theme_classic(base_size = 11) +
-    theme(
-      axis.text = element_text(color = "black"),
-      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-      legend.position = "right",
-      legend.key.height = unit(0.65, "cm"),
-      legend.spacing.y = unit(0.22, "cm"),
-      legend.text = element_text(size = 9),
-      plot.margin = margin(5.5, 16, 5.5, 5.5)
-    ) +
-    guides(color = guide_legend(override.aes = list(size = 2, alpha = 1)))
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = width, height = height)
-  print(p)
-  dev.off()
-}
-
-```
 
 ## Load data
 ```{r}
@@ -376,34 +39,33 @@ main_feature <- "CD8T_CM_tripletORp_ratio_pre"
 HCI002_data <- read_cohort("HCI002_info_save.csv")
 HCI001_data <- read_cohort("HCI001_info_save.csv")
 Nicolas_FACS_data <- read_cohort("Nicolas_all_info_FACS_save.csv", melanoma_only = TRUE)
-Nicolas_CyTEK_data <- read_cohort("Nicolas_all_info_CyTEK_save.csv", melanoma_only = TRUE)
+Nicolas_Cytek_data <- read_cohort("Nicolas_all_info_Cytek_save.csv", melanoma_only = TRUE)
 Nicolas_CyTOF_data <- read_cohort("Nicolas_all_info_CyTOF_save.csv", melanoma_only = TRUE)
 
 datasets <- list(
   HCI002 = HCI002_data,
   HCI001 = HCI001_data,
   Nicolas_FACS = Nicolas_FACS_data,
-  Nicolas_CyTEK = Nicolas_CyTEK_data,
+  Nicolas_Cytek = Nicolas_Cytek_data,
   Nicolas_CyTOF = Nicolas_CyTOF_data
 )
 
 datasets <- lapply(datasets, ensure_feats, feats = all_feats)
 datasets <- lapply(datasets, make_severe_irAE, out_col = pheno_feat)
 
-HCI002_data <- datasets$HCI002
-HCI001_data <- datasets$HCI001
-Nicolas_FACS_data <- datasets$Nicolas_FACS
-Nicolas_CyTEK_data <- datasets$Nicolas_CyTEK
-Nicolas_CyTOF_data <- datasets$Nicolas_CyTOF
-
 ```
 
 
-# Figure 3c (phenotype_type = "actionable") and SFigure 5c (phenotype_type = "conventional"). AUC bar plots.
+# Figure 3C (phenotype_type = "actionable") and SFigure 14A (right; phenotype_type = "conventional"). SFigure 15A.
 ```{r}
-phenotype_types <- c("actionable", "conventional")
 
-for (phenotype_type in phenotype_types) {
+HCI002_data <- datasets$HCI002
+HCI001_data <- datasets$HCI001
+Nicolas_FACS_data <- datasets$Nicolas_FACS
+Nicolas_Cytek_data <- datasets$Nicolas_Cytek
+Nicolas_CyTOF_data <- datasets$Nicolas_CyTOF
+
+for (phenotype_type in c('actionable', 'conventional', 'any', 'drop_mild')) {
   HCI002_data <- set_irAE_outcome(HCI002_data, phenotype_type)
   HCI001_data <- set_irAE_outcome(HCI001_data, phenotype_type)
 
@@ -411,7 +73,7 @@ for (phenotype_type in phenotype_types) {
     HCI002 = HCI002_data,
     HCI001 = HCI001_data,
     Nicolas_FACS = Nicolas_FACS_data,
-    Nicolas_CyTEK = Nicolas_CyTEK_data,
+    Nicolas_Cytek = Nicolas_Cytek_data,
     Nicolas_CyTOF = Nicolas_CyTOF_data
   )
 
@@ -461,14 +123,20 @@ for (phenotype_type in phenotype_types) {
   t.test(auc_df$CD8T_CM_tripletORp_ratio_pre[1:5], auc_df$CD4T_KI67p_ratio_pre[1:5], paired = T)
   t.test(auc_df$CD8T_CM_tripletORp_ratio_pre[1:5], auc_df$Treg_KI67p_ratio_pre[1:5], paired = T)
   t.test(auc_df$CD8T_CM_tripletORp_ratio_pre[1:5], auc_df$CD4T_EM_tripletORp_ratio_pre[1:5], paired = T)
-  
 }
+
 ```
 
 
-# Figure 4f. AUC bar plots for Olink features (fold change of proteins as predictors of severe irAE).
+# Figure 4F. AUC bar plots for Olink features (fold change of proteins as predictors of severe irAE). SFigure 14B (right; phenotype_type = "conventional"). SFigure 15B.
 ```{r}
-phenotype_types <- c("actionable")
+
+HCI002_data <- datasets$HCI002
+HCI001_data <- datasets$HCI001
+Nicolas_FACS_data <- datasets$Nicolas_FACS
+Nicolas_Cytek_data <- datasets$Nicolas_Cytek
+Nicolas_CyTOF_data <- datasets$Nicolas_CyTOF
+
 OLINK_feats <- c(
   "CXCL9_FC",
   "CXCL10_FC",
@@ -489,7 +157,7 @@ OLINK_feats <- c(
   "PGF_FC"
 )
 
-for (phenotype_type in phenotype_types) {
+for (phenotype_type in c('actionable', 'conventional', 'any', 'drop_mild')) {
   HCI002_data <- set_irAE_outcome(HCI002_data, phenotype_type)
   HCI001_data <- set_irAE_outcome(HCI001_data, phenotype_type)
 
@@ -497,7 +165,7 @@ for (phenotype_type in phenotype_types) {
     HCI002 = HCI002_data,
     HCI001 = HCI001_data,
     Nicolas_FACS = Nicolas_FACS_data,
-    Nicolas_CyTEK = Nicolas_CyTEK_data
+    Nicolas_Cytek = Nicolas_Cytek_data
   )
 
   auc_df <- sapply(OLINK_feats, function(feat) {
@@ -558,8 +226,9 @@ for (phenotype_type in phenotype_types) {
 ```
 
 
-# Figure 3i-m. Odds ratio barplots.
+# Figure 3I,J. Odds ratio barplots.
 ```{r}
+
 external_datasets <- list(
   Lozano = read_cohort("Lozano_save.csv"),
   Gerber = read_cohort("Gerber_save.csv"),
@@ -573,18 +242,40 @@ external_datasets <- lapply(external_datasets, make_severe_irAE, out_col = pheno
 
 for (dataset_name in names(external_datasets)) {
   plot_data <- prepare_binary_plot_data(external_datasets[[dataset_name]], main_feature)
-
-  or_value <- save_irAE_barplot(
+  or_value <- save_irAE_barplot2(
     plot_data,
-    paste0("barplot_", dataset_name, "_OddsRatio.pdf")
+    paste0("barplot_", dataset_name, "_OddsRatio.pdf"),
+    width = 1.5,
+    height = 1.85,
+    phenotype_type = ""
   )
-
   print(paste(dataset_name, "OR:", or_value))
 }
+
+## OR for merged data
+merged_data <- lapply(names(external_datasets), function(dataset_name) {
+  plot_data <- prepare_binary_plot_data(
+    external_datasets[[dataset_name]],
+    main_feature
+  )
+  plot_data$Cohort <- dataset_name
+  plot_data
+}) |>
+  dplyr::bind_rows()
+
+or_value <- save_irAE_barplot2(
+  merged_data,
+  paste0("barplot_5merged_OddsRatio_aCD8Tcm.pdf"),
+  width = 1.5,
+  height = 1.85,
+  phenotype_type = "" # conventional
+)
+print(paste(dataset_name, "OR:", or_value))
+
 ```
 
 
-# Figure 3n. Forest plot of OS hazard ratios across Switzerland cohorts
+# Figure 3K. Forest plot of OS hazard ratios across Switzerland cohorts
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
@@ -710,8 +401,14 @@ result_df
 ```
 
 
-# Figure 5b,d. Feature importance and Odds ratio bar plots of the machine learning model.
+# Figure 5B,D. Feature importance and Odds ratio bar plots of the LR model.
 ```{r}
+
+HCI002_data <- datasets$HCI002
+HCI001_data <- datasets$HCI001
+Nicolas_FACS_data <- datasets$Nicolas_FACS
+Nicolas_Cytek_data <- datasets$Nicolas_Cytek
+Nicolas_CyTOF_data <- datasets$Nicolas_CyTOF
 
 HCI002_data$severe_irAE <- HCI002_data$IRAEactionable01
 HCI001_data$severe_irAE <- HCI001_data$IRAEactionable01
@@ -720,7 +417,7 @@ model_datasets <- list(
   HCI002 = HCI002_data,
   HCI001 = HCI001_data,
   Nicolas_FACS = Nicolas_FACS_data,
-  Nicolas_CyTEK = Nicolas_CyTEK_data,
+  Nicolas_Cytek = Nicolas_Cytek_data,
   Nicolas_CyTOF = Nicolas_CyTOF_data
 )
 
@@ -729,10 +426,15 @@ model_datasets <- lapply(model_datasets, zscore_feats, feats = sig_feats)
 HCI002_data <- model_datasets$HCI002
 HCI001_data <- model_datasets$HCI001
 Nicolas_FACS_data <- model_datasets$Nicolas_FACS
-Nicolas_CyTEK_data <- model_datasets$Nicolas_CyTEK
+Nicolas_Cytek_data <- model_datasets$Nicolas_Cytek
 Nicolas_CyTOF_data <- model_datasets$Nicolas_CyTOF
 
 logistic_model <- fit_logistic(HCI002_data, y_col = pheno_feat, x_cols = sig_feats)
+
+a <- HCI002_data[, c(pheno_feat, sig_feats)]
+a <- na.omit(a)
+dim(a)
+sum(a$severe_irAE)
 
 coef_values <- coef(logistic_model)[-1]
 
@@ -771,127 +473,508 @@ model_datasets <- list(
   HCI001 = HCI001_data,
   Nicolas_FACS = Nicolas_FACS_data,
   Nicolas_CyTOF = Nicolas_CyTOF_data,
-  Nicolas_CyTEK = Nicolas_CyTEK_data
+  Nicolas_Cytek = Nicolas_Cytek_data
 )
-
 model_datasets <- lapply(model_datasets, add_model_prediction, y_col = pheno_feat, x_cols = sig_feats, model = logistic_model)
+phenotype_types5 <- c("actionable", "actionable", "conventional", "conventional", "conventional")
 
 HCI002_data <- model_datasets$HCI002
 HCI001_data <- model_datasets$HCI001
 Nicolas_FACS_data <- model_datasets$Nicolas_FACS
 Nicolas_CyTOF_data <- model_datasets$Nicolas_CyTOF
-Nicolas_CyTEK_data <- model_datasets$Nicolas_CyTEK
+Nicolas_Cytek_data <- model_datasets$Nicolas_Cytek
 
-for (dataset_name in names(model_datasets)) {
+for (i in 1:5) {
+  dataset_name <- names(model_datasets)[i]
+  pt <- phenotype_types5[i]
   plot_data <- prepare_binary_plot_data(model_datasets[[dataset_name]], "integrated")
 
-  save_irAE_barplot(
+  save_irAE_barplot2(
     plot_data,
     paste0("barplot_", dataset_name, "_ML.pdf"),
-    width = 1.5 * 0.95 * 1.3,
-    height = 2.7 * 0.95 * 0.8 * 1.3
+    width = 1.5 * 0.95 * 1.1,
+    height = 2.7 * 0.95 * 0.8 * 1.1,
+    phenotype_type = ""
   )
 }
 
+## OR for merged data
+merged_data <- lapply(names(model_datasets), function(dataset_name) {
+  plot_data <- prepare_binary_plot_data(
+    model_datasets[[dataset_name]],
+    "integrated"
+  )
+  plot_data$Cohort <- dataset_name
+  plot_data
+}) |>
+  dplyr::bind_rows()
+
+or_value <- save_irAE_barplot2(
+  merged_data,
+  paste0("barplot_5merged_OddsRatio_ML.pdf"),
+  width = 1.5 * 0.95 * 1.1,
+  height = 2.7 * 0.95 * 0.8 * 1.1,
+  phenotype_type = "" # conventional
+)
+print(paste(dataset_name, "OR:", or_value))
+
+
 ```
 
-# Figure 5c. AUC comparison between Integrated ML vs other signatures (across 5 datasets).
+# SFigure 11, STable 10
 ```{r}
+
+phenotype_type <- "actionable"
+
+HCI002_data <- set_irAE_outcome(HCI002_data, phenotype_type)
+HCI001_data <- set_irAE_outcome(HCI001_data, phenotype_type)
+
 model_datasets <- list(
   HCI002 = HCI002_data,
   HCI001 = HCI001_data,
-  Nicolas_FACS = Nicolas_FACS_data,
-  Nicolas_CyTEK = Nicolas_CyTEK_data,
-  Nicolas_CyTOF = Nicolas_CyTOF_data
+  Nunez1_FACS = Nicolas_FACS_data,
+  Nunez2_Cytek = Nicolas_Cytek_data
 )
 
-auc_df <- matrix(
-  NA_real_,
-  nrow = length(model_datasets),
-  ncol = length(c("MODEL_sig_feats", all_feats)),
-  dimnames = list(names(model_datasets), c("MODEL_sig_feats", all_feats))
-) %>%
-  as.data.frame()
+dataset_labels <- c(
+  HCI002 = "HCI002",
+  HCI001 = "HCI001",
+  Nunez1_FACS = "Nunez1",
+  Nunez2_Cytek = "Nunez2"
+)
 
-for (dataset_name in names(model_datasets)) {
-  df <- model_datasets[[dataset_name]]
+auc_df <- lapply(names(model_datasets), function(dataset_name) {
 
-  auc_df[dataset_name, "MODEL_sig_feats"] <- predict_auc(
-    logistic_model,
-    df,
-    y_col = pheno_feat,
-    x_cols = sig_feats
-  )$auc
+  df_roc <- model_datasets[[dataset_name]] %>%
+    filter(
+      !is.na(severe_irAE),
+      !is.na(CXCL9_pre)
+    )
 
-  for (feat in all_feats) {
-    auc_df[dataset_name, feat] <- compute_single_feature_auc(df, pheno_feat, feat)
+  roc_obj <- roc(
+    response  = df_roc$severe_irAE,
+    predictor = df_roc$CXCL9_pre,
+    levels    = c(0, 1),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  auc_ci <- ci.auc(
+    roc_obj,
+    method = "delong"
+  )
+
+  data.frame(
+    dataset = dataset_name,
+    label = dataset_labels[dataset_name],
+    n = nrow(df_roc),
+    AUC = as.numeric(auc(roc_obj)),
+    CI_low = as.numeric(auc_ci[1]),
+    CI_high = as.numeric(auc_ci[3])
+  )
+}) %>%
+  bind_rows()
+
+
+auc_df$label <- factor(
+  auc_df$label,
+  levels = unname(dataset_labels)
+)
+
+auc_df
+
+auc_df$label <- factor(
+  auc_df$label,
+  levels = rev(c(
+    "HCI002",
+    "HCI001",
+    "Nunez1",
+    "Nunez2"
+  ))
+)
+
+p_auc <- ggplot(
+  auc_df,
+  aes(x = AUC, y = label)
+) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    linewidth = 0.6,
+    color = "grey50"
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = CI_low,
+      xmax = CI_high
+    ),
+    height = 0.15,
+    linewidth = 0.8
+  ) +
+  geom_point(
+    size = 3
+  ) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    x = "AUC (95% CI)",
+    y = NULL
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 13),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+save_pdf(print(p_auc), file.path(result_figure_dir, paste0("AUC_4datasets_CXCL9_pre.pdf")), width = 2 * 0.6 * 3, height = 2 * 0.4 * 3)
+
+
+########### train LR model with different datasets
+HCI002_data_temp <- datasets$HCI002
+HCI001_data_temp <- datasets$HCI001
+Nicolas_FACS_data_temp <- datasets$Nicolas_FACS
+Nicolas_Cytek_data_temp <- datasets$Nicolas_Cytek
+Nicolas_CyTOF_data_temp <- datasets$Nicolas_CyTOF
+
+HCI002_data_temp$severe_irAE <- HCI002_data_temp$IRAEactionable01
+HCI001_data_temp$severe_irAE <- HCI001_data_temp$IRAEactionable01
+
+model_datasets <- list(
+  HCI002 = HCI002_data_temp,
+  HCI001 = HCI001_data_temp,
+  Nicolas_FACS = Nicolas_FACS_data_temp,
+  Nicolas_Cytek = Nicolas_Cytek_data_temp,
+  Nicolas_CyTOF = Nicolas_CyTOF_data_temp
+)
+
+model_datasets <- lapply(model_datasets, zscore_feats, feats = sig_feats)
+
+HCI002_data_temp <- model_datasets$HCI002
+HCI001_data_temp <- model_datasets$HCI001
+Nicolas_FACS_data_temp <- model_datasets$Nicolas_FACS
+Nicolas_Cytek_data_temp <- model_datasets$Nicolas_Cytek
+Nicolas_CyTOF_data_temp <- model_datasets$Nicolas_CyTOF
+
+logistic_model <- fit_logistic(Nicolas_CyTOF_data_temp, y_col = pheno_feat, x_cols = sig_feats)
+
+coef_values <- coef(logistic_model)[-1]
+
+```
+
+# SFigure 17, STable 11
+```{r}
+
+HCI002_info <- read_cohort("HCI002_info_save.csv")
+data_selected1 <- HCI002_info[, c("patient_therapy", "Therapy_type", "Response01", "TMB (mutation /mb)")] 
+data_selected2 <- HCI002_data[, c("patient_therapy", "integrated", "CD8T_CM_tripletORp_ratio_pre", "CXCL9_FC", "irAE_grade", "IRAEactionable01")] 
+data_selected2 <- make_severe_irAE(data_selected2, grade_col = "irAE_grade", out_col = "severe_irAE")
+data_selected_HCI002 <- merge(data_selected1, data_selected2, by = "patient_therapy")
+colnames(data_selected_HCI002)[colnames(data_selected_HCI002) == "TMB (mutation /mb)"] <- "TMB"
+
+data_selected <- data_selected_HCI002
+
+df <- data_selected %>%
+  select(Response01, IRAEactionable01, TMB, integrated) %>%
+  na.omit()
+## ROC curves with Youden index
+HCI002_actionable_plot <- df[, c("integrated", "IRAEactionable01")]
+colnames(HCI002_actionable_plot) <- c("feature", "phenotype")
+save_roc_plot_with_youden(
+  HCI002_actionable_plot,
+  "ROC_HCI002_actionable_irAE_Youden_cutoff_integrated.pdf"
+)
+HCI002_actionable_plot <- df[, c("TMB", "Response01")]
+colnames(HCI002_actionable_plot) <- c("feature", "phenotype")
+save_roc_plot_with_youden(
+  HCI002_actionable_plot,
+  "ROC_HCI002_Response01_Youden_cutoff_TMB.pdf"
+)
+
+# Youden cutoffs
+roc_tmb <- roc(df$Response01, df$TMB,
+               levels = c(0, 1), direction = "<", quiet = TRUE)
+
+roc_irae <- roc(df$IRAEactionable01, df$integrated,
+                levels = c(0, 1), direction = "<", quiet = TRUE)
+
+cut_tmb <- as.numeric(coords(
+  roc_tmb, "best", best.method = "youden", ret = "threshold"
+)[[1]][1])
+
+cut_irae <- as.numeric(coords(
+  roc_irae, "best", best.method = "youden", ret = "threshold"
+)[[1]][1])
+
+df <- df %>%
+  na.omit()
+
+# Four regions
+df <- df %>%
+  mutate(
+    TMB_group = ifelse(TMB >= cut_tmb, "TMB-high", "TMB-low"),
+    irAE_group = ifelse(integrated >= cut_irae, "irAE-high", "irAE-low"),
+    region = paste(TMB_group, irAE_group, sep = " / ")
+  )
+
+# Response and irAE rates in each region
+region_summary <- df %>%
+  group_by(region) %>%
+  summarise(
+    n = n(),
+    response_n = sum(Response01 == 1),
+    response_rate = mean(Response01 == 1),
+    irAE_n = sum(IRAEactionable01 == 1),
+    irAE_rate = mean(IRAEactionable01 == 1),
+    .groups = "drop"
+  )
+
+region_summary
+
+```
+
+# SFigure 14C (left) (phenotype_type = "conventional"). ROC plots, box plots, bar plots.
+```{r}
+main_feature <- "integrated"
+
+for (phenotype_type in phenotype_types) {
+  HCI002_data <- set_irAE_outcome(HCI002_data, phenotype_type)
+  HCI001_data <- set_irAE_outcome(HCI001_data, phenotype_type)
+
+  hci_datasets <- list(HCI001 = HCI001_data, HCI002 = HCI002_data)
+
+  for (dataset_name in names(hci_datasets)) {
+    plot_data <- prepare_binary_plot_data(hci_datasets[[dataset_name]], main_feature)
+
+    save_irAE_barplot2(
+      plot_data = plot_data,
+      paste0("barplot_", dataset_name, "_", main_feature, "_", phenotype_type, ".pdf"),
+      width = 1.5 * 1.05,
+      phenotype_type = phenotype_type
+    )
+    
+    plot_data_temp <- plot_data
+    plot_data_temp$feature <- plot_data_temp$feature/100
+    save_feature_boxplot(
+      plot_data_temp,
+      paste0("boxplot_", dataset_name, "_",  main_feature, "_", phenotype_type, ".pdf"),
+      ylabel = "Integrated score", ylim = 0.9
+    )
+
+    save_roc_plot(
+      plot_data,
+      paste0("ROC_", dataset_name, "_",  main_feature, "_", phenotype_type, ".pdf")
+    )
   }
 }
 
-ml_features <- c(
-  "MODEL_sig_feats",
-  "CD8T_CM_tripletORp_ratio_pre",
-  "CXCL9_pre",
-  "CD8T_KI67p_ratio_pre",
-  "CD4T_KI67p_ratio_pre",
-  "Treg_KI67p_ratio_pre",
-  "CD4TM_tripletORp_ratio_pre",
-  "CD8T_EMRA_CD38p_ratio_pre",
-  "CD4T_EM_tripletORp_ratio_pre",
-  "CD4T_EM_ratio_pre",
-  "CD4T_Naive_ratio_pre",
-  "CXCL10_pre",
-  "CXCL11_pre",
-  "IFNG_pre"
+```
+
+# SFigure 16C. Performance on HCI001/HCI002 with a fixed cutoff of integrated_pre
+```{r}
+
+main_feature <- "integrated"
+
+HCI002_actionable <- set_irAE_outcome(
+  HCI002_data,
+  "actionable"
 )
 
-ml_labels <- c(
-  "Integrated",
-  "Activated CD8Tcm",
-  "CXCL9",
-  "Ki67+ CD8T",
-  "Ki67+ CD4T",
-  "Ki67+ Treg",
-  "Activated CD4Tm",
-  "CD38+ CD8Temra",
-  "Activated CD4Tem",
-  "CD4Tem",
-  "Naive CD4T",
-  "CXCL10",
-  "CXCL11",
-  "IFNG"
+HCI002_actionable_plot <- prepare_binary_plot_data(
+  HCI002_actionable,
+  feature_col = main_feature
 )
 
-save_auc_comparison(
-  auc_df = auc_df,
-  selected_features = ml_features,
-  labels = ml_labels,
-  file_name = "barplot_AUC_compare_AllDatasets_ML.pdf",
-  width = 4.5 * 1.35 * 0.8,
-  height = 3.3 * 1.2 * 0.8
+HCI002_youden <- get_youden_cutoff(
+  HCI002_actionable_plot
 )
 
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD8T_CM_tripletORp_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_Naive_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD8T_EMRA_CD38p_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD8T_KI67p_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4TM_tripletORp_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_EM_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_KI67p_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$IFNG_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$Treg_KI67p_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_EM_tripletORp_ratio_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CXCL9_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CXCL11_pre[1:5], paired = T)
-t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CXCL10_pre[1:5], paired = T)
+cutoff_youden <- HCI002_youden$threshold
+
+save_roc_plot_with_youden(
+  HCI002_actionable_plot,
+  "ROC_HCI002_actionable_integrated_Youden_cutoff.pdf"
+)
+
+datasets_cutoff <- list(
+  HCI001 = HCI001_data,
+  HCI002 = HCI002_data
+)
+
+for (phenotype_type in phenotype_types) {
+  for (dataset_name in names(datasets_cutoff)) {
+    df <- set_irAE_outcome(
+      datasets_cutoff[[dataset_name]],
+      phenotype_type
+    )
+    plot_data <- prepare_binary_plot_data(
+      df,
+      feature_col = main_feature,
+      cutoff = cutoff_youden
+    )
+    cat(
+      dataset_name,
+      phenotype_type,
+      "cutoff =",
+      attr(plot_data, "cutoff"),
+      "\n"
+    )
+    save_irAE_barplot2(
+      plot_data,
+      paste0(
+        "barplot_",
+        dataset_name,
+        "_",main_feature,"_",
+        phenotype_type,
+        "_Youden_cutoff.pdf"
+      ),
+      width = 1.5 * 1.2,
+      height = 2.7 * 0.95,
+      phenotype_type = phenotype_type
+    )
+  }
+}
 
 ```
 
 
-# Figure 5e and SFigure 7f. Survival analysis.
+# Figure 5C (phenotype_type = "actionable") and SFigure 14C (right; phenotype_type = "conventional") AUC comparison between Integrated ML vs other signatures (across 5 datasets). SFigure 15C.
+```{r}
+
+HCI002_data_temp <- datasets$HCI002
+HCI001_data_temp <- datasets$HCI001
+Nicolas_FACS_data_temp <- datasets$Nicolas_FACS
+Nicolas_Cytek_data_temp <- datasets$Nicolas_Cytek
+Nicolas_CyTOF_data_temp <- datasets$Nicolas_CyTOF
+
+HCI002_data_temp$severe_irAE <- HCI002_data_temp$IRAEactionable01
+HCI001_data_temp$severe_irAE <- HCI001_data_temp$IRAEactionable01
+
+model_datasets <- list(
+  HCI002 = HCI002_data_temp,
+  HCI001 = HCI001_data_temp,
+  Nicolas_FACS = Nicolas_FACS_data_temp,
+  Nicolas_Cytek = Nicolas_Cytek_data_temp,
+  Nicolas_CyTOF = Nicolas_CyTOF_data_temp
+)
+
+model_datasets <- lapply(model_datasets, zscore_feats, feats = sig_feats)
+
+HCI002_data_temp <- model_datasets$HCI002
+HCI001_data_temp <- model_datasets$HCI001
+Nicolas_FACS_data_temp <- model_datasets$Nicolas_FACS
+Nicolas_Cytek_data_temp <- model_datasets$Nicolas_Cytek
+Nicolas_CyTOF_data_temp <- model_datasets$Nicolas_CyTOF
+
+logistic_model <- fit_logistic(HCI002_data, y_col = pheno_feat, x_cols = sig_feats)
+
+
+for (phenotype_type in c('actionable', 'conventional', 'any', 'drop_mild')) {
+  HCI002_temp <- set_irAE_outcome(HCI002_data, phenotype_type)
+  HCI001_temp <- set_irAE_outcome(HCI001_data, phenotype_type)
+  
+  model_datasets <- list(
+    HCI002 = HCI002_temp,
+    HCI001 = HCI001_temp,
+    Nicolas_FACS = Nicolas_FACS_data,
+    Nicolas_Cytek = Nicolas_Cytek_data,
+    Nicolas_CyTOF = Nicolas_CyTOF_data
+  )
+  
+  auc_df <- matrix(
+    NA_real_,
+    nrow = length(model_datasets),
+    ncol = length(c("MODEL_sig_feats", all_feats)),
+    dimnames = list(names(model_datasets), c("MODEL_sig_feats", all_feats))
+  ) %>%
+    as.data.frame()
+  
+  for (dataset_name in names(model_datasets)) {
+    df <- model_datasets[[dataset_name]]
+    auc_df[dataset_name, "MODEL_sig_feats"] <- predict_auc(
+      logistic_model,
+      df,
+      y_col = pheno_feat,
+      x_cols = sig_feats
+    )$auc
+  
+    for (feat in all_feats) {
+      auc_df[dataset_name, feat] <- compute_single_feature_auc(df, pheno_feat, feat)
+    }
+  }
+  
+  ml_features <- c(
+    "MODEL_sig_feats",
+    "CD8T_CM_tripletORp_ratio_pre",
+    "CXCL9_pre",
+    "CD8T_KI67p_ratio_pre",
+    "CD4T_KI67p_ratio_pre",
+    "Treg_KI67p_ratio_pre",
+    "CD4TM_tripletORp_ratio_pre",
+    "CD8T_EMRA_CD38p_ratio_pre",
+    "CD4T_EM_tripletORp_ratio_pre",
+    "CD4T_EM_ratio_pre",
+    "CD4T_Naive_ratio_pre",
+    "CXCL10_pre",
+    "CXCL11_pre",
+    "IFNG_pre"
+  )
+  
+  ml_labels <- c(
+    "Integrated",
+    "Activated CD8Tcm",
+    "CXCL9",
+    "Ki67+ CD8T",
+    "Ki67+ CD4T",
+    "Ki67+ Treg",
+    "Activated CD4Tm",
+    "CD38+ CD8Temra",
+    "Activated CD4Tem",
+    "CD4Tem",
+    "Naive CD4T",
+    "CXCL10",
+    "CXCL11",
+    "IFNG"
+  )
+  
+  save_auc_comparison(
+    auc_df = auc_df,
+    selected_features = ml_features,
+    labels = ml_labels,
+    file_name = paste0("barplot_AUC_compare_AllDatasets_ML_", phenotype_type, ".pdf"),
+    width = 4.5 * 1.35 * 0.8,
+    height = 3.3 * 1.2 * 0.8
+  )
+  
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD8T_CM_tripletORp_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_Naive_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD8T_EMRA_CD38p_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD8T_KI67p_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4TM_tripletORp_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_EM_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$IFNG_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_KI67p_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$Treg_KI67p_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CD4T_EM_tripletORp_ratio_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CXCL11_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CXCL9_pre[1:5], paired = T)
+  t.test(auc_df$MODEL_sig_feats[1:5], auc_df$CXCL10_pre[1:5], paired = T)
+}
+
+```
+
+
+# Figure 5E and SFigure 12F. Survival analysis.
 ```{r}
 make_survival_df <- function(df, score_col = "integrated", high_rule = c(">=", ">")) {
   high_rule <- match.arg(high_rule)
+
+  # Add missing PFS columns as NA
+  if (!"PFS_time" %in% colnames(df)) df$PFS_time <- NA_real_
+  if (!"PFS_event" %in% colnames(df)) df$PFS_event <- NA_real_
 
   out <- df[, c(score_col, "OS_time", "OS_event", "PFS_time", "PFS_event"), drop = FALSE]
   colnames(out) <- c("integrated", "OS_time", "OS_event", "PFS_time", "PFS_event")
@@ -912,90 +995,12 @@ make_survival_df <- function(df, score_col = "integrated", high_rule = c(">=", "
   out
 }
 
-save_km_plot <- function(df, phenotype, predictor_name, cohort_type, y_label) {
-  survival_df <- df[, c("score", paste0(phenotype, "_time"), paste0(phenotype, "_event"))]
-  colnames(survival_df) <- c("Score", "time", "event")
-
-  survival_df <- na.omit(survival_df)
-  survival_df$Score <- relevel(survival_df$Score, ref = "Low")
-
-  sfit <- survfit(Surv(time, event) ~ Score, data = survival_df)
-  cox_fit <- coxph(Surv(time, event) ~ Score, data = survival_df)
-  cox_sum <- summary(cox_fit)
-
-  hr <- cox_sum$coefficients[2]
-  p_val <- cox_sum$coefficients[5]
-  hr_ci <- cox_sum$conf.int[3:4]
-
-  surv_plot <- ggsurvplot(
-    sfit,
-    data = survival_df,
-    size = 1,
-    palette = c("#00305d", "#9c1915"),
-    conf.int = FALSE,
-    pval = FALSE,
-    xlim = c(-3, 70),
-    ylim = c(0, 1),
-    xlab = "Time (months)",
-    ylab = y_label,
-    break.time.by = 10,
-    risk.table = TRUE,
-    risk.table.height = 0.25,
-    risk.table.pos = "out",
-    risk.table.col = "black",
-    risk.table.y.text = FALSE,
-    tables.y.text = FALSE,
-    tables.theme = theme_cleantable(),
-    legend.labs = c("Low", "High"),
-    legend.title = "",
-    legend = c(0.75, 0.95),
-    font.main = c(12),
-    font.caption = c(12),
-    font.legend = c(12),
-    font.tickslab = c(12),
-    font.x = c(12),
-    font.y = c(12),
-    ggtheme = theme(
-      legend.background = element_rect(fill = NA, color = NA),
-      legend.key = element_rect(fill = NA, color = NA),
-      plot.margin = unit(c(0.2, 0.2, 0, 0.2), "cm"),
-      panel.background = element_rect(fill = "white"),
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.border = element_blank(),
-      axis.line = element_line(colour = "black"),
-      axis.text.x = element_text(colour = "black"),
-      axis.text.y = element_text(colour = "black")
-    )
-  )
-
-  surv_plot$plot <- surv_plot$plot +
-    annotate(
-      "text",
-      x = 0,
-      y = 0.15,
-      hjust = 0,
-      size = 5,
-      label = paste0(
-        "HR = ", round(hr, 2),
-        " (", round(hr_ci[1], 2), "-", round(hr_ci[2], 2), ")",
-        "\np = ", sprintf("%.3f", p_val)
-      )
-    )
-
-  pdf(file.path(result_figure_dir, paste0("KM_curve_", phenotype, "_", predictor_name, "_ML_", cohort_type, ".pdf")), width = 3.3, height = 3)
-  print(surv_plot, newpage = FALSE)
-  dev.off()
-
-  invisible(c(HR = hr, p = p_val))
-}
-
 survival_datasets <- list(
   HCI002 = make_survival_df(HCI002_data, high_rule = ">"),
   HCI001 = make_survival_df(HCI001_data, high_rule = ">"),
   Nicolas_FACS = make_survival_df(Nicolas_FACS_data, high_rule = ">"),
   Nicolas_CyTOF = make_survival_df(Nicolas_CyTOF_data, high_rule = ">"),
-  Nicolas_CyTEK = make_survival_df(Nicolas_CyTEK_data, high_rule = ">")
+  Nicolas_Cytek = make_survival_df(Nicolas_Cytek_data, high_rule = ">")
 )
 
 survival_labels <- c(
@@ -1009,14 +1014,14 @@ for (cohort_type in c("Pooled", "HCI002")) {
       transform(survival_datasets$HCI002, cohort = "HCI002"),
       transform(survival_datasets$HCI001, cohort = "HCI001"),
       transform(survival_datasets$Nicolas_FACS, cohort = "Nicolas_FACS"),
-      transform(survival_datasets$Nicolas_CyTEK, cohort = "Nicolas_CyTEK")
+      transform(survival_datasets$Nicolas_Cytek, cohort = "Nicolas_Cytek")
     )
   } else {
     transform(survival_datasets$HCI002, cohort = "HCI002")
   }
 
   for (phenotype in names(survival_labels)) {
-    save_km_plot(
+    save_km_plot2(
       survival_df,
       phenotype = phenotype,
       predictor_name = "Integrated",
@@ -1029,7 +1034,7 @@ for (cohort_type in c("Pooled", "HCI002")) {
 ```
 
 
-# Figure 5f. Multivariable Cox regression forest plots for OS and PFS in HCI002
+# Figure 5F. Multivariable Cox regression forest plots for OS and PFS in HCI002
 ```{r}
 test_var <- "integrated"
 test_var_label <- "Integrated"
@@ -1160,11 +1165,15 @@ save_forest_plot(
 result_df
 ```
 
-
-# SFigure 5d. Pooled analysis (Odds ratio barplot, K-M curves)
+# SFigure 9A. Pooled analysis (Odds ratio barplot, K-M curves). 
 ```{r}
+
+main_feature <- "CD8T_CM_tripletORp_ratio_pre" 
+
 clinical_feats <- c(
   "CD8T_CM_tripletORp_ratio_pre",
+  "CXCL9_pre",
+  "CXCL9_FC",
   "irAE_grade",
   "prior_BRAFi_MEKi",
   "prior_ICI",
@@ -1182,7 +1191,7 @@ pooled_datasets <- list(
   HCI002 = read_cohort("HCI002_info_save.csv"),
   HCI001 = read_cohort("HCI001_info_save.csv"),
   Nicolas_FACS = read_cohort("Nicolas_all_info_FACS_save.csv", melanoma_only = TRUE),
-  Nicolas_CyTEK = read_cohort("Nicolas_all_info_CyTEK_save.csv", melanoma_only = TRUE),
+  Nicolas_Cytek = read_cohort("Nicolas_all_info_Cytek_save.csv", melanoma_only = TRUE),
   Nicolas_CyTOF = read_cohort("Nicolas_all_info_CyTOF_save.csv", melanoma_only = TRUE),
   Lozano = read_cohort("Lozano_save.csv"),
   Gerber = read_cohort("Gerber_save.csv"),
@@ -1194,24 +1203,6 @@ pooled_datasets <- list(
 pooled_datasets <- lapply(pooled_datasets, ensure_feats, feats = clinical_feats)
 pooled_datasets <- lapply(pooled_datasets, function(df) df[, clinical_feats])
 pooled_datasets <- lapply(pooled_datasets, make_severe_irAE, out_col = pheno_feat)
-
-make_binary_score <- function(df, score_col, high_rule = c(">=", ">")) {
-  high_rule <- match.arg(high_rule)
-  med <- median(df[[score_col]], na.rm = TRUE)
-  ok <- !is.na(df[[score_col]])
-
-  score <- rep(NA_character_, nrow(df))
-  if (high_rule == ">=") {
-    score[ok & df[[score_col]] >= med] <- "High"
-    score[ok & df[[score_col]] < med] <- "Low"
-  } else {
-    score[ok & df[[score_col]] > med] <- "High"
-    score[ok & df[[score_col]] <= med] <- "Low"
-  }
-
-  df[[score_col]] <- factor(score, levels = c("Low", "High"))
-  df
-}
 
 pooled_datasets <- lapply(pooled_datasets, make_binary_score, score_col = main_feature, high_rule = ">")
 
@@ -1238,7 +1229,7 @@ all_merged_survival <- bind_rows(
   transform(pooled_datasets$HCI002, cohort = "HCI002"),
   transform(pooled_datasets$HCI001, cohort = "HCI001"),
   transform(pooled_datasets$Nicolas_FACS, cohort = "Nicolas_FACS"),
-  transform(pooled_datasets$Nicolas_CyTEK, cohort = "Nicolas_CyTEK"),
+  transform(pooled_datasets$Nicolas_Cytek, cohort = "Nicolas_Cytek"),
   transform(pooled_datasets$Switzerland1, cohort = "Switzerland1"),
   transform(pooled_datasets$Switzerland2, cohort = "Switzerland2"),
   transform(pooled_datasets$Switzerland3, cohort = "Switzerland3")
@@ -1254,7 +1245,7 @@ all_merged_survival <- all_merged_survival %>%
 km_input <- all_merged_survival %>%
   select(score = all_of(main_feature), OS_time, OS_event, PFS_time, PFS_event)
 
-save_km_plot(
+save_km_plot2(
   km_input,
   phenotype = "OS",
   predictor_name = main_feature,
@@ -1267,12 +1258,97 @@ plot_data <- all_merged_survival %>%
   drop_na() %>%
   mutate(group = factor(group, levels = c("Low", "High")))
 
-save_irAE_barplot(plot_data, "barplot_pooled.pdf")
+save_irAE_barplot(plot_data, paste0("barplot_pooled.pdf"), width = 1.5, height = 1.85, phenotype_type = "")
+
+plot_data <- all_merged_survival %>%
+  select(group = all_of(main_feature), phenotype = severe_irAE) %>%
+  drop_na() %>%
+  mutate(group = factor(group, levels = c("Low", "High")))
+
+save_irAE_barplot2(plot_data, paste0("barplot_pooled.pdf"), width = 1.2*1.2, height = 1.85*1.2, phenotype_type = "")
 
 ```
 
-# SFigure 5e. Subgroup analysis summary table
+# SFigure 13A,B. revision for Pooled analysis (Odds ratio barplot)  for CXCL9 and aCD8Tcm, PD1 vs CTLA4 subgroup analysis
 ```{r}
+########## for revision  (odds ratio pooled analysis)
+drug <- "CTLA4-containing" # "CTLA4-containing" "PD1/PDL1"
+drug_name <- "CTLA4" # "CTLA4" "PD1"
+
+####for aCD8T_CM
+filtered_data <- all_merged_survival # [all_merged_survival$cohort == "HCI002", ] # all or HCI002 only
+filtered_data <- filtered_data[filtered_data$Drug == drug, c("CD8T_CM_tripletORp_ratio_pre", "severe_irAE")] # "CTLA4-containing" "PD1/PDL1"
+filtered_data <- na.omit(filtered_data)
+dim(filtered_data)
+table(filtered_data$severe_irAE)
+plot_data <- filtered_data %>%
+  select(group = "CD8T_CM_tripletORp_ratio_pre", phenotype = severe_irAE) %>%
+  drop_na() %>%
+  mutate(group = factor(group, levels = c("Low", "High")))
+save_irAE_barplot2(plot_data, paste0("barplot_pooled_", drug_name, "_aCD8Tcm.pdf"), width = 1.5, height = 1.85, phenotype_type = "")
+
+
+########## for CXCL9
+filtered_data <- all_merged_survival 
+filtered_data <- filtered_data[filtered_data$Drug == drug, c("CXCL9_FC", "severe_irAE")] # "CTLA4-containing" "PD1/PDL1"
+filtered_data <- na.omit(filtered_data)
+dim(filtered_data)
+table(filtered_data$severe_irAE)
+plot_data <- filtered_data %>%
+  select(group = "CXCL9_FC", phenotype = severe_irAE) %>%
+  drop_na() %>%
+  mutate(
+    group = ifelse(group > median(group), "High", "Low"),
+    group = factor(group, levels = c("Low", "High"))
+  )
+save_irAE_barplot2(plot_data, paste0("barplot_pooled_", drug_name, "_CXCL9FC.pdf"), width = 1.5, height = 1.85, phenotype_type = "")
+
+```
+
+
+# SFigure 13C. pooled analaysis of integrated sig. include PD1 vs CTLA4 subgroup analysis
+```{r}
+
+main_feature <- "integrated"
+pooled_datasets_temp <- list(
+  HCI002 = HCI002_data[, c("integrated", "irAE_grade", "Drug")],
+  HCI001 = HCI001_data[, c("integrated", "irAE_grade", "Drug")],
+  Nicolas_FACS = Nicolas_FACS_data[, c("integrated", "irAE_grade", "Drug")],
+  Nicolas_Cytek = Nicolas_Cytek_data[, c("integrated", "irAE_grade", "Drug")],
+  Nicolas_CyTOF = Nicolas_CyTOF_data[, c("integrated", "irAE_grade", "Drug")]
+)
+
+pooled_datasets_temp <- lapply(pooled_datasets_temp, make_severe_irAE, out_col = pheno_feat)
+pooled_datasets_temp <- lapply(pooled_datasets_temp, make_binary_score, score_col = main_feature, high_rule = ">")
+all_merged_temp <- bind_rows(
+  transform(pooled_datasets_temp$HCI002, cohort = "HCI002"),
+  transform(pooled_datasets_temp$HCI001, cohort = "HCI001"),
+  transform(pooled_datasets_temp$Nicolas_FACS, cohort = "Nicolas_FACS"),
+  transform(pooled_datasets_temp$Nicolas_Cytek, cohort = "Nicolas_Cytek")
+)
+
+drug <- "CTLA4-containing" # "CTLA4-containing" "PD1/PDL1"
+drug_name <- "CTLA4" # "CTLA4" "PD1"
+filtered_data <- all_merged_temp 
+filtered_data <- filtered_data[filtered_data$Drug == drug, c("integrated", "severe_irAE")] 
+filtered_data <- na.omit(filtered_data)
+dim(filtered_data)
+table(filtered_data$severe_irAE)
+plot_data <- filtered_data %>%
+  select(group = all_of(main_feature), phenotype = severe_irAE) %>%
+  drop_na() %>%
+  mutate(group = factor(group, levels = c("Low", "High")))
+save_irAE_barplot2(plot_data, paste0("barplot_pooled_", drug_name, "_ML.pdf"), width = 1.5, height = 1.85, phenotype_type = "")
+
+
+```
+
+
+# STable9. Subgroup analysis summary table
+```{r}
+
+main_feature <- "CD8T_CM_tripletORp_ratio_pre"
+
 subgroup_feats <- c(
   "CD8T_CM_tripletORp_ratio_pre",
   "irAE_grade",
@@ -1288,7 +1364,7 @@ subgroup_datasets <- list(
   HCI002 = read_cohort("HCI002_info_save.csv"),
   HCI001 = read_cohort("HCI001_info_save.csv"),
   Nicolas_FACS = read_cohort("Nicolas_all_info_FACS_save.csv", melanoma_only = TRUE),
-  Nicolas_CyTEK = read_cohort("Nicolas_all_info_CyTEK_save.csv", melanoma_only = TRUE),
+  Nicolas_Cytek = read_cohort("Nicolas_all_info_Cytek_save.csv", melanoma_only = TRUE),
   Nicolas_CyTOF = read_cohort("Nicolas_all_info_CyTOF_save.csv", melanoma_only = TRUE),
   Lozano = read_cohort("Lozano_save.csv"),
   Gerber = read_cohort("Gerber_save.csv"),
@@ -1321,7 +1397,7 @@ subgroup_df <- bind_rows(
   transform(subgroup_datasets$HCI002, cohort = "HCI002"),
   transform(subgroup_datasets$HCI001, cohort = "HCI001"),
   transform(subgroup_datasets$Nicolas_FACS, cohort = "Nicolas_FACS"),
-  transform(subgroup_datasets$Nicolas_CyTEK, cohort = "Nicolas_CyTEK"),
+  transform(subgroup_datasets$Nicolas_Cytek, cohort = "Nicolas_Cytek"),
   transform(subgroup_datasets$Switzerland1, cohort = "Switzerland1"),
   transform(subgroup_datasets$Switzerland2, cohort = "Switzerland2"),
   transform(subgroup_datasets$Switzerland3, cohort = "Switzerland3")
@@ -1375,7 +1451,11 @@ make_subgroup_table <- function(dat, predictor_num = main_feature) {
   for (var in names(subgroup_specs)) {
     for (lvl in subgroup_specs[[var]]) {
       df_sub <- dat0 %>%
-        filter(!is.na(.data[[var]]), .data[[var]] == lvl)
+        filter(
+          !is.na(.data[[var]]),
+          .data[[var]] == lvl,
+          !is.na(.data[[pheno_feat]])
+        )
 
       subgroup_median <- median(df_sub[[predictor_num]], na.rm = TRUE)
 
@@ -1407,33 +1487,40 @@ make_subgroup_table <- function(dat, predictor_num = main_feature) {
 }
 
 subgroup_results <- make_subgroup_table(subgroup_df)
-write.csv(subgroup_results, file.path(result_data_dir, "Pooled_analysis_subgroup_OR_OS.csv"), row.names = FALSE)
+write.csv(subgroup_results, file.path(data_dir,"merged_cohorts", "Pooled_analysis_subgroup_OR_OS.csv"), row.names = FALSE)
 
 ```
 
 
-# Load data for SFigure 7a-e.
+# Load data for SFigure 12A-E.
 ```{r}
-data_dir2 <- "./SourceData/"
 
 HCI002_all_info <- readr::read_csv(
-  file.path(data_dir2, "HCI002_all_info.csv"),
+  file.path(data_dir, "HCI002_all_info.csv"),
   name_repair = "minimal"
 )
 
-pheno_all_info_HCI002 <- HCI002_all_info[, c(1:60, 25933:25934)] %>%
+pheno_all_info_HCI002 <- HCI002_all_info[, c(1:19, 25892:25894)] %>%
   merge(
-    HCI002_data[, c("patient_therapy", "integrated")],
+    HCI002_data[, c("patient_therapy", "integrated", "irAE_grade")],
     by = "patient_therapy",
     all.x = TRUE
   ) %>%
   distinct(patient_therapy, .keep_all = TRUE)
+irAE_grade_vec <- pheno_all_info_HCI002$irAE_grade
+pheno_all_info_HCI002$`irAE Overall Assessment` <- dplyr::case_when(
+  is.na(irAE_grade_vec) ~ NA_character_,
+  irAE_grade_vec >= 3  ~ "Severe",
+  irAE_grade_vec == 2  ~ "Moderate",
+  irAE_grade_vec == 1  ~ "Mild",
+  irAE_grade_vec == 0  ~ "None"
+)
 
 feature_test <- "integrated"
 ```
 
 
-# SFigure 7a. Integrated score across irAE severity groups.
+# SFigure 12A. Integrated score across irAE severity groups.
 ```{r}
 plot_df <- pheno_all_info_HCI002 %>%
   transmute(
@@ -1472,7 +1559,7 @@ wilcox.test(
 )
 ```
 
-# SFigure 7b. AUC comparison across HCI002 clinical subgroups.
+# SFigure 12B. AUC comparison across HCI002 clinical subgroups.
 ```{r}
 compute_auc_summary <- function(df, predictor_col, outcome_col = "Phenotype") {
   auc_df <- df %>%
@@ -1572,7 +1659,7 @@ for (group_col in names(subgroup_specs)) {
 
 ```
 
-# SFigure 7c. Integrated model AUC across irAE subtypes.
+# SFigure 12C. Integrated model AUC across irAE subtypes.
 ```{r}
 irae_subtypes <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01")
 
@@ -1613,8 +1700,7 @@ print(p)
 dev.off()
 ```
 
-
-# SFigure 7d,e. Association between integrated score and baseline clinical variables in HCI002.
+# SFigure 12D,E. Association between integrated score and baseline clinical variables in HCI002.
 ```{r}
 plot_df <- pheno_all_info_HCI002 %>%
   transmute(
@@ -1713,7 +1799,3 @@ wilcox_results <- bind_rows(lapply(categorical_vars, function(var_name) {
 
 wilcox_results
 ```
-
-
-
-

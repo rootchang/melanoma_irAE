@@ -1,6 +1,6 @@
 ---
 title: "Predicting irAE with Olink serum proteins"
-author: "Tiangen Chang"
+author: "Tiangen Chang <tiangen.chang@sjtu.edu.cn>"
 output:
   rmarkdown::html_vignette:
     toc: true
@@ -12,45 +12,34 @@ vignette: >
 ---
 
 ####### This script makes the below displays for the paper
-## Figure 4c-e,g
+## Figure 4C-E,G
+## SFigure 14B
+## SFigure 16B
+## STable 3
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, results = "markup", warning = FALSE, message = FALSE)
-```
-
-# Package Loading
-```{r}
-library(dplyr)
-library(ggplot2)
-library(readr)
-library(readxl)
-library(pROC)
-library(survival)
-library(survminer)
-library(ComplexHeatmap)
-
-```
-
-
-# parameters and constants and common functions
-```{r}
-result_figure_dir <- "Figures"
-data_dir <- "SourceData"
-
-fig_path <- function(file) file.path(result_figure_dir, file)
-data_path <- function(file) file.path(data_dir, file)
-
+source("utils.R")
 ```
 
 
 # Load data
 ```{r}
 HCI002_all_info <- readr::read_csv(data_path("HCI002_all_info.csv"), name_repair = "minimal")
+HCI002_map_df <- read.csv(file.path(data_dir, "HCI002_OlinkID_ProteinName_map.csv"))
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)
+HCI002_data <- read.csv(file.path(data_dir, "/merged_cohorts/HCI002_info_save.csv"), stringsAsFactors = FALSE)
+HCI002_all_info <- HCI002_all_info %>%
+  merge(
+    HCI002_data[, c("patient_therapy", setdiff(colnames(HCI002_data), colnames(HCI002_all_info)))],
+    by = "patient_therapy",
+    all.x = TRUE
+  )
+
 HCI002_map_df <- read.csv(data_path("HCI002_OlinkID_ProteinName_map.csv"))
 ```
 
-
-# Figure 4c. Heatmap (of Olink protein fold-change).
+# Figure 4C. Heatmap (of Olink protein fold-change).
 ```{r}
 map_olink_features <- function(feature_df, time_point, map_df) {
   olink_df <- feature_df[grepl(paste0("OLINK_", time_point), colnames(feature_df))]
@@ -76,7 +65,14 @@ rank_features_by_group_fc <- function(expr_mat, group_vec, case_level) {
 }
 
 irAE_vec <- HCI002_all_info$IRAEactionable01
-irAE_grade_vec <- HCI002_all_info$`irAE Overall Assessment`
+irAE_grade_vec <- HCI002_all_info$irAE_grade
+irAE_grade_vec <- dplyr::case_when(
+  is.na(irAE_grade_vec) ~ NA_character_,
+  irAE_grade_vec >= 3  ~ "Severe",
+  irAE_grade_vec == 2  ~ "Moderate",
+  irAE_grade_vec == 1  ~ "Mild",
+  irAE_grade_vec == 0  ~ "None"
+)
 ICBR_vec <- HCI002_all_info$Response01
 sex_vec <- HCI002_all_info$Gender
 IPIdrug_vec <- HCI002_all_info$Drug
@@ -87,7 +83,7 @@ genes_show <- c(
   "PGF", "CA6"
 )
 
-HCI002_feature_df <- HCI002_all_info[61:25932]
+HCI002_feature_df <- HCI002_all_info[20:25891]
 HCI002_OLINK_FC_on_pre_df <- map_olink_features(HCI002_feature_df, "FC_on_pre", HCI002_map_df)
 
 expr_mat <- apply(HCI002_OLINK_FC_on_pre_df, 2, as.numeric)
@@ -187,43 +183,10 @@ dev.off()
 
 ```
 
-# Figure 4g. Heatmap (of AUCs).
+# Figure 4G. Heatmap (of AUCs).
 ```{r}
-timePt_test <- "FC_on_pre"
-sheet_names <- c("IRAE_GI01", "IRAE_HB01", "IRAE_skin01", "IRAE_MSK01", "IRAEactionable01")
-file_path <- data_path("HCI002_AUCs_allPhenotypes.xlsx")
 
-read_auc_sheet <- function(sheet_name, time_point) {
-  data_raw <- as.data.frame(read_excel(file_path, sheet = sheet_name))
-  data_filtered <- data_raw[grepl(paste0("OLINK_", time_point, "$"), data_raw[[1]]), 1:3]
-  colnames(data_filtered) <- c("Protein", paste0("AUC_", sheet_name), paste0("p_", sheet_name))
-  data_filtered
-}
-
-result_df <- Reduce(
-  function(x, y) merge(x, y, by = "Protein", all = TRUE),
-  lapply(sheet_names, read_auc_sheet, time_point = timePt_test)
-)
-
-proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)
-
-result_df$Protein <- gsub(paste0("_OLINK_", timePt_test), "", result_df$Protein)
-result_df$ProteinName <- proteins_mapping[result_df$Protein]
-result_df <- result_df[!duplicated(result_df$ProteinName), ]
-
-auc_cols <- paste0("AUC_", sheet_names)
-p_cols <- paste0("p_", sheet_names)
-
-result_df$irAE_AUC_mean <- rowMeans(result_df[auc_cols], na.rm = TRUE)
-result_df <- result_df[order(result_df$irAE_AUC_mean, decreasing = TRUE), ]
-
-genes_show <- c(
-  "CXCL9", "CXCL10", "CXCL11", "IFNG", "CXCL13", "IL17A", "IL10", "IL12A",
-  "IL21", "B4GALT1", "CD276", "CD70", "FLT3LG", "FSTL3", "IL2RB", "KRT19",
-  "PGF", "CA6", "MIA", "PDCD1", "HLA-DRA"
-)
-
-plot_df <- result_df[result_df$ProteinName %in% genes_show, c(auc_cols, p_cols, "ProteinName")]
+plot_df <- read.csv(paste0(data_dir, "HCI002_AUCs_irAE_subtypes.csv"))
 
 AUC_matrix <- as.matrix(plot_df[auc_cols])
 rownames(AUC_matrix) <- plot_df$ProteinName
@@ -273,10 +236,13 @@ dev.off()
 
 ```
 
-# Figure 4d. AUC comparison of selected Olink proteins across time points in HCI002
+# Figure 4D. AUC comparison of selected Olink proteins across time points in HCI002
 ```{r}
 proteins_test <- c("CXCL9", "CA6")
 timepoints <- c("baseline", "ontreat", "FC_on_pre")
+
+phenotype_type <- "conventional" # "actionable", "conventional"
+HCI002_all_info <- set_irAE_outcome(HCI002_all_info, phenotype_type)
 
 protein_map <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)
 selected_olink_ids <- HCI002_map_df$OlinkID[HCI002_map_df$Assay %in% proteins_test]
@@ -293,7 +259,7 @@ for (olink_id in names(protein_map)) {
   colnames(HCI002_feature_df) <- gsub(olink_id, protein_map[[olink_id]], colnames(HCI002_feature_df))
 }
 
-compute_auc <- function(df, feature_col, outcome_col = "IRAEactionable01") {
+compute_auc <- function(df, feature_col, outcome_col = "severe_irAE") {
   auc_df <- df %>%
     select(outcome = all_of(outcome_col), predictor = all_of(feature_col)) %>%
     drop_na()
@@ -340,11 +306,11 @@ compute_auc <- function(df, feature_col, outcome_col = "IRAEactionable01") {
 
 auc_input <- cbind(
   HCI002_feature_df,
-  IRAEactionable01 = HCI002_all_info$IRAEactionable01
+  severe_irAE = HCI002_all_info$severe_irAE
 )
 
 result_df <- bind_rows(lapply(colnames(HCI002_feature_df), function(feature_col) {
-  compute_auc(auc_input, feature_col)
+  compute_auc(auc_input, feature_col, "severe_irAE")
 }))
 
 plot_df <- result_df %>%
@@ -416,42 +382,21 @@ dev.off()
 
 ```
 
-# Figure 4e. Severe-irAE-free survival by CXCL9 fold-change in HCI002
+# Figure 4E. Severe-irAE-free survival by CXCL9 fold-change in HCI002
 ```{r}
-feature_col <- "CXCL9_FC_on_pre"
+feature_col <- "CXCL9_FC"
 
-predictor_df <- HCI002_all_info %>%
-  select(`Vial ID`, patient_therapy) %>%
-  bind_cols(HCI002_feature_df[, feature_col, drop = FALSE]) %>%
-  mutate(uniqueID = paste0(patient_therapy, "_", `Vial ID`)) %>%
-  distinct(uniqueID, .keep_all = TRUE)
+predictor_df <- HCI002_all_info 
+survival_info_df <- read_cohort("HCI002_info_save.csv")
 
-survival_info_df <- readxl::read_excel(data_path("HCI002_clinical_info.xlsx")) %>%
-  select(
-    `Vial ID`,
-    `Record ID`,
-    `Systemic Therapy Name`,
-    `Systemic Therapy Type`,
-    Nonsevere_irAE_time,
-    Nonsevere_irAE_event
-  ) %>%
-  mutate(
-    uniqueID = paste0(
-      `Record ID`, "_",
-      `Systemic Therapy Name`, "_",
-      `Systemic Therapy Type`, "_",
-      `Vial ID`
-    )
-  )
-
-survival_df <- merge(predictor_df, survival_info_df, by = "uniqueID", all.x = TRUE) %>%
+survival_df <- predictor_df %>%
   filter(!is.na(.data[[feature_col]])) %>%
   transmute(
     Score = factor(
       ifelse(.data[[feature_col]] > median(.data[[feature_col]], na.rm = TRUE), "High", "Low"),
       levels = c("Low", "High")
     ),
-    time = as.numeric(Nonsevere_irAE_time) / 30,
+    time = as.numeric(Nonsevere_irAE_time),
     event = as.numeric(Nonsevere_irAE_event)
   ) %>%
   drop_na()
@@ -523,3 +468,143 @@ pdf(fig_path(paste0("KM_curve_Nonsevere_irAE_FoldChange_", feature_col, ".pdf"))
 print(km_plot, newpage = FALSE)
 dev.off()
 ```
+
+
+# SFigure 16B
+```{r}
+
+HCI002_all_info <- read_cohort("HCI002_info_save.csv")
+HCI001_all_info <- read_cohort("HCI001_info_save.csv")
+main_feature <- "CXCL9_FC"
+
+# set phenotype
+HCI002_actionable <- set_irAE_outcome(
+  HCI002_all_info,
+  "actionable"
+)
+
+# prepare continuous ROC data
+HCI002_actionable_plot <- prepare_binary_plot_data(
+  HCI002_actionable,
+  feature_col = main_feature
+)
+
+# calculate Youden cutoff
+HCI002_youden <- get_youden_cutoff(
+  HCI002_actionable_plot
+)
+
+cutoff_youden <- HCI002_youden$threshold
+
+# ROC plot with cutoff point
+save_roc_plot_with_youden(
+  HCI002_actionable_plot,
+  paste0("ROC_HCI002_",main_feature,"_actionable_Youden_cutoff.pdf")
+)
+
+datasets <- list(
+  HCI001 = HCI001_all_info,
+  HCI002 = HCI002_all_info
+)
+
+for (phenotype_type in phenotype_types) {
+  for (dataset_name in names(datasets)) {
+    df <- set_irAE_outcome(
+      datasets[[dataset_name]],
+      phenotype_type
+    )
+    plot_data <- prepare_binary_plot_data(
+      df,
+      feature_col = main_feature,
+      cutoff = cutoff_youden
+    )
+    cat(
+      dataset_name,
+      phenotype_type,
+      "cutoff =",
+      attr(plot_data, "cutoff"),
+      "\n"
+    )
+    save_irAE_barplot2(
+      plot_data,
+      paste0(
+        "barplot_",
+        dataset_name,
+        "_",main_feature,"_",
+        phenotype_type,
+        "_Youden_cutoff.pdf"
+      ),
+      width = 1.5 * 1.2,
+      height = 2.7 * 0.95,
+      phenotype_type = phenotype_type
+    )
+  }
+}
+
+```
+
+
+# SFigure 14B
+```{r}
+main_feature <- "CXCL9_FC"
+HCI002_data <- read_cohort("HCI002_info_save.csv")
+HCI001_data <- read_cohort("HCI001_info_save.csv")
+
+for (phenotype_type in phenotype_types) {
+  HCI002_data <- set_irAE_outcome(HCI002_data, phenotype_type)
+  HCI001_data <- set_irAE_outcome(HCI001_data, phenotype_type)
+
+  hci_datasets <- list(HCI001 = HCI001_data, HCI002 = HCI002_data)
+
+  for (dataset_name in names(hci_datasets)) {
+    plot_data <- prepare_binary_plot_data(hci_datasets[[dataset_name]], main_feature)
+    plot_data$feature <- plot_data$feature/100
+    
+    save_irAE_barplot2(
+      plot_data = plot_data,
+      paste0("barplot_", main_feature, "_", dataset_name, "_", phenotype_type, ".pdf"),
+      width = 1.5 * 0.88,
+      height = 2.7 * 0.9,
+      phenotype_type = "" # phenotype_type
+    )
+
+    save_feature_boxplot(
+      plot_data,
+      paste0("boxplot_", main_feature, "_", dataset_name, "_", phenotype_type, ".pdf"),
+      width = 1.5*0.95, height = 3.3*0.9,
+      ylabel = "CXCL9 fold change", ylim = 100
+    )
+
+    save_roc_plot(
+      plot_data,
+      paste0("ROC_", main_feature, "_", dataset_name, "_", phenotype_type, ".pdf")
+    )
+  }
+}
+
+```
+
+
+# STable 3.
+```{r}
+
+test_data <- HCI001_data # HCI001 HCI002
+
+grade_group <- case_when(
+  test_data$irAE_grade %in% c(0, 1) ~ "Grade 0–1",
+  test_data$irAE_grade == 2 ~ "Grade 2",
+  test_data$irAE_grade >= 3 ~ "Grade ≥3",
+  TRUE ~ NA_character_
+)
+
+intervention_group <- case_when(
+  test_data$IRAEactionable01 == 0 ~ "No immunosuppression / permanent intervention",
+  test_data$IRAEactionable01 == 1 ~ "Immunosuppression / permanent intervention",
+  TRUE ~ NA_character_
+)
+
+table(grade_group, intervention_group, useNA = "ifany")
+
+```
+
+

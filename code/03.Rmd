@@ -1,6 +1,6 @@
 ---
 title: "Correlate CyTOF and Olink features in HCI002"
-author: "Tiangen Chang"
+author: "Tiangen Chang <tiangen.chang@sjtu.edu.cn>"
 output:
   rmarkdown::html_vignette:
     toc: true
@@ -12,224 +12,27 @@ vignette: >
 ---
 
 ####### This script makes the below displays for the paper
-## Figure 3a,b,d-h
-## SFigure 1c,d
-## SFigure 5a,b
-## SFigure 4a-g
-## SFigure 6h
+## Figure 3A,B,D-H
+## SFigure 4C,D
+## SFigure 14A (left)
+## SFigure 6A-E
+## SFigure 7
+## SFigure 8
+## SFigure 9B,C
+## SFigure 10H
+## SFigure 14A
+## SFigure 16A
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, results = "markup", message = FALSE, warning = FALSE)
+source("utils.R")
 ```
 
-# Package Loading
-```{r}
-library(readr)
-library(dplyr)
-library(ggplot2)
-library(pROC)
-library(VennDiagram)
-library(ComplexHeatmap)
-library(circlize)
-library(grid)
-library(pROC)
-
-```
-
-# Parameters and shared functions
-```{r}
-result_figure_dir <- "./Figures/"
-data_dir <- "./SourceData/"
-
-dir.create(result_figure_dir, showWarnings = FALSE, recursive = TRUE)
-
-map_olink_names <- function(x, protein_map) {
-  mapped <- protein_map[colnames(x)]
-  mapped[is.na(mapped)] <- colnames(x)[is.na(mapped)]
-  colnames(x) <- mapped
-  x[, !duplicated(colnames(x)), drop = FALSE]
-}
-
-extract_cytof <- function(df, feature_names, pattern) {
-  keep <- grepl(pattern, feature_names) &
-    !grepl("_ABS$", feature_names) &
-    !grepl("IGG4", feature_names)
-
-  x <- as.matrix(df[keep])
-  colnames(x) <- gsub(paste0("_", pattern, ".*"), "", colnames(x))
-  x
-}
-
-extract_olink <- function(df, feature_names, pattern, suffix, protein_map) {
-  keep <- grepl("OID", feature_names) & grepl(pattern, feature_names)
-  x <- as.matrix(df[keep])
-  colnames(x) <- gsub(suffix, "", colnames(x))
-  map_olink_names(x, protein_map)
-}
-
-filter_sparse_features <- function(x, max_na_fraction = 0.5) {
-  x[, colMeans(is.na(x)) <= max_na_fraction, drop = FALSE]
-}
-
-save_pdf <- function(plot_expr, file, width, height) {
-  pdf(file, width = width, height = height, onefile = FALSE)
-  on.exit(dev.off(), add = TRUE)
-  force(plot_expr)
-}
-
-get_cor_and_p <- function(x, y, row_names, col_names) {
-  cor_matrix <- matrix(NA_real_, nrow = ncol(x), ncol = ncol(y),
-                       dimnames = list(row_names, col_names))
-  p_matrix <- cor_matrix
-
-  for (i in seq_len(ncol(x))) {
-    for (j in seq_len(ncol(y))) {
-      test <- suppressWarnings(cor.test(
-        x[, i], y[, j],
-        method = "spearman",
-        use = "pairwise.complete.obs"
-      ))
-      cor_matrix[i, j] <- unname(test$estimate)
-      p_matrix[i, j] <- test$p.value
-    }
-  }
-
-  list(cor = cor_matrix, p = p_matrix)
-}
-
-make_severe_irAE <- function(df, grade_col = "irAE_grade", out_col = "severe_irAE") {
-  if (!grade_col %in% colnames(df)) stop(sprintf("Column '%s' not found.", grade_col))
-  grade <- suppressWarnings(as.numeric(df[[grade_col]]))
-  df[[out_col]] <- ifelse(is.na(grade), NA, ifelse(grade >= 3, 1, 0))
-  df
-}
-
-set_irAE_outcome <- function(df, phenotype_type) {
-  if (phenotype_type == "actionable") {
-    df$severe_irAE <- df$IRAEactionable01
-  } else if (phenotype_type == "conventional") {
-    df <- make_severe_irAE(df, out_col = "severe_irAE")
-  } else {
-    stop("phenotype_type must be 'actionable' or 'conventional'.")
-  }
-  df
-}
-
-
-prepare_binary_plot_data <- function(df, feature_col, outcome_col = "severe_irAE") {
-  df %>%
-    select(feature = all_of(feature_col), phenotype = all_of(outcome_col)) %>%
-    drop_na() %>%
-    mutate(
-      group = factor(ifelse(feature <= median(feature, na.rm = TRUE), "Low", "High"), levels = c("Low", "High")),
-      phenotype_label = factor(phenotype, levels = c(0, 1), labels = c("No severe irAE", "Severe irAE"))
-    )
-}
-
-calc_group_rate_or <- function(plot_data) {
-  rates <- aggregate(
-    phenotype ~ group,
-    data = plot_data,
-    FUN = function(x) mean(as.numeric(x) == 1) * 100
-  )
-
-  odds_high <- rates$phenotype[2] / (100 - rates$phenotype[2])
-  odds_low <- rates$phenotype[1] / (100 - rates$phenotype[1])
-  list(rates = rates, or = round(odds_high / odds_low, 1))
-}
-
-save_irAE_barplot <- function(plot_data, file_name, width = 1.5 * 0.95, height = 2.7 * 0.95) {
-  stat <- calc_group_rate_or(plot_data)
-
-  p <- ggplot(stat$rates, aes(x = group, y = phenotype, fill = group)) +
-    geom_bar(stat = "identity", color = "black", width = 0.6) +
-    labs(x = NULL, y = "Severe irAE (%)") +
-    ylim(0, 100) +
-    theme_classic() +
-    theme(
-      axis.text = element_text(color = "black"),
-      legend.position = "none"
-    ) +
-    geom_segment(aes(x = 1, xend = 2, y = 90, yend = 90), linewidth = 0.4) +
-    geom_segment(aes(x = 1, xend = 1, y = 90, yend = 86), linewidth = 0.4) +
-    geom_segment(aes(x = 2, xend = 2, y = 90, yend = 86), linewidth = 0.4) +
-    annotate("text", x = 1.5, y = 97, label = paste0("OR = ", stat$or), size = 3)
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = width, height = height)
-  print(p)
-  dev.off()
-
-  invisible(stat$or)
-}
-
-save_feature_boxplot <- function(plot_data, file_name) {
-  p_val <- wilcox.test(feature ~ phenotype_label, data = plot_data)$p.value
-
-  p <- ggplot(plot_data, aes(x = phenotype_label, y = feature * 100, fill = phenotype_label)) +
-    geom_jitter(aes(color = phenotype_label), width = 0.2, size = 2) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.5, color = "black") +
-    scale_color_manual(values = c("blue", "brown")) +
-    scale_fill_manual(values = c("blue", "brown")) +
-    labs(x = NULL, y = "% activated CD8Tcm / CD8Tcm") +
-    ylim(0, 90) +
-    theme_classic() +
-    theme(
-      axis.text = element_text(color = "black"),
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      legend.position = "none"
-    ) +
-    geom_signif(
-      comparisons = list(c("No severe irAE", "Severe irAE")),
-      annotations = paste0("p = ", signif(p_val, 2)),
-      textsize = 4,
-      y_position = 80,
-      vjust = -0.5,
-      tip_length = 0.05
-    )
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = 1.5, height = 3.3)
-  print(p)
-  dev.off()
-}
-
-save_roc_plot <- function(plot_data, file_name) {
-  roc_obj <- pROC::roc(
-    response = plot_data$phenotype,
-    predictor = plot_data$feature,
-    levels = c(0, 1),
-    direction = "<",
-    quiet = TRUE
-  )
-
-  auc_ci <- pROC::ci.auc(roc_obj)
-  label <- sprintf("AUC = %.2f (%.2f,%.2f)", auc_ci[2], auc_ci[1], auc_ci[3])
-
-  roc_df <- data.frame(
-    fpr = 1 - roc_obj$specificities,
-    sensitivity = roc_obj$sensitivities
-  ) %>%
-    arrange(fpr, sensitivity) %>%
-    distinct()
-
-  p <- ggplot(roc_df, aes(x = fpr, y = sensitivity)) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray70") +
-    geom_step(direction = "vh", color = "black", linewidth = 1) +
-    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
-    labs(x = "1 - Specificity", y = "Sensitivity") +
-    annotate("text", x = 0.17, y = 0.1, hjust = 0, label = label, size = 4) +
-    theme_classic() +
-    theme(axis.text = element_text(color = "black"))
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = 2.7, height = 2.2)
-  print(p)
-  dev.off()
-}
-
-```
 
 
 # Load data
 ```{r}
+
 HCI002_all_info <- read_csv(
   file.path(data_dir, "HCI002_all_info.csv"),
   name_repair = "minimal",
@@ -251,15 +54,7 @@ HCI001_all_info <- read_csv(
   name_repair = "minimal",
   show_col_types = FALSE
 )
-HCI001_all_info$`RedCap ID0` <- sub("_.*", "", HCI001_all_info$`RedCap ID`)
-HCI001_all_info$`Current Therapy` <- HCI001_all_info$`Current Therapy` %>%
-  str_replace_all("\\u00A0", "") %>%   # remove all non-breaking spaces
-  str_trim(side = "both")              # trim any remaining whitespace
-HCI001_all_info$patient_therapy = paste(HCI001_all_info$`RedCap ID0`, HCI001_all_info$`Current Therapy`, HCI001_all_info$`Type of therapy`, sep = "_")
-HCI001_all_info <- HCI001_all_info[!duplicated(HCI001_all_info$patient_therapy), ]
-patient_therapy_final <- read_excel(paste0(data_dir, "TableS2.xlsx"))
-patient_therapy_final <- patient_therapy_final$patient_therapy
-HCI001_all_info <- HCI001_all_info[HCI001_all_info$patient_therapy %in% patient_therapy_final, ]
+
 HCI001_data <- read.csv(file.path(data_dir, "/merged_cohorts/HCI001_info_save.csv"), stringsAsFactors = FALSE)
 HCI001_all_info <- HCI001_all_info %>%
   merge(
@@ -270,10 +65,8 @@ HCI001_all_info <- HCI001_all_info %>%
 
 ```
 
-
-# Figure 3a-b (phenotype_type = "actionable") and SFigure 5a-b (phenotype_type = "conventional"). ROC plots, box plots, bar plots.
+# Figure 3A,B (phenotype_type = "actionable") and SFigure 14A (left) (phenotype_type = "conventional"). ROC plots, box plots, bar plots.
 ```{r}
-phenotype_types <- c("actionable", "conventional")
 main_feature <- "CD8T_CM_tripletORp_ratio_pre"
 
 for (phenotype_type in phenotype_types) {
@@ -285,14 +78,18 @@ for (phenotype_type in phenotype_types) {
   for (dataset_name in names(hci_datasets)) {
     plot_data <- prepare_binary_plot_data(hci_datasets[[dataset_name]], main_feature)
 
-    save_irAE_barplot(
-      plot_data,
-      paste0("barplot_", dataset_name, "_", phenotype_type, ".pdf")
+    save_irAE_barplot2(
+      plot_data = plot_data,
+      paste0("barplot_", dataset_name, "_", phenotype_type, ".pdf"),
+      width = 1.5 * 0.86,
+      height = 2.7 * 0.9,
+      phenotype_type = "" # phenotype_type
     )
 
     save_feature_boxplot(
       plot_data,
-      paste0("boxplot_", dataset_name, "_", phenotype_type, ".pdf")
+      paste0("boxplot_", dataset_name, "_", phenotype_type, ".pdf"),
+      width = 1.5*0.95, height = 3.3*0.9
     )
 
     save_roc_plot(
@@ -301,12 +98,257 @@ for (phenotype_type in phenotype_types) {
     )
   }
 }
+
 ```
+
+# SFigure 8.
+```{r}
+
+data_used <- "NR" # All R NR
+irAE_type <- "conventional"  # c("actionable", "conventional")
+HCI002_all_info <- set_irAE_outcome(HCI002_all_info, "conventional")
+
+if (data_used == "All"){
+  data_selected <- HCI002_all_info
+}else if (data_used == "R"){
+  data_selected <- HCI002_all_info[HCI002_all_info$Response01 == 1, ]
+}else if (data_used == "NR"){
+  data_selected <- HCI002_all_info[HCI002_all_info$Response01 == 0, ]
+}
+
+if (irAE_type == "actionable"){
+  plot_data <- data_selected[, c("CD8T_CM_tripletORp_ratio_pre", "IRAEactionable01")]
+}else if (irAE_type == "conventional"){
+  plot_data <- data_selected[, c("CD8T_CM_tripletORp_ratio_pre", "severe_irAE")]
+}
+
+colnames(plot_data) <- c("feature", "phenotype")
+save_roc_plot(
+  plot_data,
+  paste0("ROC_HCI002_",irAE_type,"_",data_used,".pdf")
+)
+
+table(HCI002_all_info$Response01, HCI002_all_info$IRAEactionable01)
+
+```
+
+
+# SFigure 9B.
+```{r}
+main_feature <- "CD8T_CM_tripletORp_ratio_pre" 
+
+age <- "young" # old young
+
+for (phenotype_type in phenotype_types[1]) {
+  temp <- set_irAE_outcome(HCI002_all_info, phenotype_type)
+  if (age == "old"){
+    temp <- temp[temp$Age >= 65, ]
+  }else if (age == "young"){
+    temp <- temp[temp$Age < 65, ]
+  }
+  hci_datasets <- list(HCI002 = temp)
+
+  for (dataset_name in names(hci_datasets)) {
+    plot_data <- prepare_binary_plot_data(hci_datasets[[dataset_name]], main_feature)
+    plot_data <- na.omit(plot_data)
+    print(paste("N = ", nrow(plot_data), ", events = ", sum(plot_data$phenotype)))
+    
+    save_irAE_barplot2(
+      plot_data = plot_data,
+      paste0("barplot_", dataset_name, "_", phenotype_type, "_", age, ".pdf"),
+      width = 1.5, height = 1.85,
+      phenotype_type = "" # phenotype_type
+    )
+
+    save_roc_plot(
+      plot_data,
+      paste0("ROC_", dataset_name, "_", phenotype_type, "_", age, ".pdf")
+    )
+  }
+}
+
+```
+
+
+# SFigure 9C.
+```{r}
+
+main_feature <- "CD8T_CM_tripletORp_ratio_pre" # "CD8T_CM_tripletORp_ratio_pre" "CXCL9_FC"
+age <- "old" # old young
+
+clinical_feats <- c(
+  "CD8T_CM_tripletORp_ratio_pre",
+  "CXCL9_pre",
+  "CXCL9_FC",
+  "irAE_grade",
+  "prior_BRAFi_MEKi",
+  "prior_ICI",
+  "Drug",
+  "Sex",
+  "Age",
+  "Stage",
+  "OS_time",
+  "OS_event",
+  "PFS_time",
+  "PFS_event"
+)
+
+pooled_datasets <- list(
+  HCI002 = read_cohort("HCI002_info_save.csv"),
+  HCI001 = read_cohort("HCI001_info_save.csv"),
+  Nicolas_FACS = read_cohort("Nicolas_all_info_FACS_save.csv", melanoma_only = TRUE),
+  Nicolas_Cytek = read_cohort("Nicolas_all_info_Cytek_save.csv", melanoma_only = TRUE),
+  Nicolas_CyTOF = read_cohort("Nicolas_all_info_CyTOF_save.csv", melanoma_only = TRUE),
+  Lozano = read_cohort("Lozano_save.csv"),
+  Gerber = read_cohort("Gerber_save.csv"),
+  Switzerland1 = read_cohort("Switzerland1_save.csv"),
+  Switzerland2 = read_cohort("Switzerland2_save.csv"),
+  Switzerland3 = read_cohort("Switzerland3_save.csv")
+)
+
+
+pooled_datasets <- lapply(pooled_datasets, ensure_feats, feats = clinical_feats)
+pooled_datasets <- lapply(pooled_datasets, function(df) df[, clinical_feats])
+pooled_datasets <- lapply(pooled_datasets, make_severe_irAE, out_col = pheno_feat)
+standardize_clinical_types <- function(df) {
+  df %>%
+    mutate(
+      prior_BRAFi_MEKi = as.character(prior_BRAFi_MEKi),
+      prior_ICI = as.character(prior_ICI),
+      Drug = as.character(Drug),
+      Sex = as.character(Sex),
+      Stage = as.character(Stage),
+      irAE_grade = suppressWarnings(as.numeric(irAE_grade)),
+      severe_irAE = suppressWarnings(as.numeric(severe_irAE)),
+      OS_time = suppressWarnings(as.numeric(OS_time)),
+      OS_event = suppressWarnings(as.numeric(OS_event)),
+      PFS_time = suppressWarnings(as.numeric(PFS_time)),
+      PFS_event = suppressWarnings(as.numeric(PFS_event))
+    )
+}
+
+pooled_datasets <- lapply(pooled_datasets, standardize_clinical_types)
+
+all_merged_age <- bind_rows(
+  transform(pooled_datasets$HCI002, cohort = "HCI002"),
+  transform(pooled_datasets$HCI001, cohort = "HCI001"),
+  transform(pooled_datasets$Nicolas_FACS, cohort = "Nicolas_FACS"),
+  transform(pooled_datasets$Nicolas_Cytek, cohort = "Nicolas_Cytek"),
+  transform(pooled_datasets$Switzerland1, cohort = "Switzerland1"),
+  transform(pooled_datasets$Switzerland2, cohort = "Switzerland2"),
+  transform(pooled_datasets$Switzerland3, cohort = "Switzerland3")
+)
+
+
+all_merged_age <- all_merged_age %>%
+  mutate(
+    Sex = recode(Sex, M = "Male", F = "Female"),
+    Stage = ifelse(!is.na(Stage) & Stage != "4", "1-3", Stage),
+    prior_ICI = recode(as.character(prior_ICI), `0` = "no", `1` = "yes")
+  )
+
+dataset_name <- "nonHCI002"
+all_merged_age <- all_merged_age[all_merged_age$cohort != "HCI002", ]
+
+if (age == "old"){
+  temp <- all_merged_age[all_merged_age$Age >= 65, ]
+}else if (age == "young"){
+  temp <- all_merged_age[all_merged_age$Age < 65, ]
+}
+
+temp <- make_binary_score(temp, score_col = main_feature, high_rule = ">")
+
+plot_data <- temp %>%
+  select(group = all_of(main_feature), phenotype = severe_irAE) %>%
+  drop_na() %>%
+  mutate(group = factor(group, levels = c("Low", "High")))
+
+save_irAE_barplot2(plot_data, paste0("barplot_pooled_", dataset_name, "_", age,".pdf"), width = 1.5, height = 1.85, phenotype_type = "")
+
+```
+
+
+
+# SFigure 16A.
+```{r}
+
+main_feature <- "CD8T_CM_tripletORp_ratio_pre"
+
+# set phenotype
+HCI002_actionable <- set_irAE_outcome(
+  HCI002_all_info,
+  "actionable"
+)
+
+# prepare continuous ROC data
+HCI002_actionable_plot <- prepare_binary_plot_data(
+  HCI002_actionable,
+  feature_col = main_feature
+)
+
+# calculate Youden cutoff
+HCI002_youden <- get_youden_cutoff(
+  HCI002_actionable_plot
+)
+
+cutoff_youden <- HCI002_youden$threshold
+
+print(HCI002_youden)
+
+# ROC plot with cutoff point
+save_roc_plot_with_youden(
+  HCI002_actionable_plot,
+  "ROC_HCI002_actionable_Youden_cutoff.pdf"
+)
+
+
+datasets <- list(
+  HCI001 = HCI001_all_info,
+  HCI002 = HCI002_all_info
+)
+
+for (phenotype_type in phenotype_types) {
+  for (dataset_name in names(datasets)) {
+    df <- set_irAE_outcome(
+      datasets[[dataset_name]],
+      phenotype_type
+    )
+    plot_data <- prepare_binary_plot_data(
+      df,
+      feature_col = main_feature,
+      cutoff = cutoff_youden
+    )
+    cat(
+      dataset_name,
+      phenotype_type,
+      "cutoff =",
+      attr(plot_data, "cutoff"),
+      "\n"
+    )
+    save_irAE_barplot2(
+      plot_data,
+      paste0(
+        "barplot_",
+        dataset_name,
+        "_",
+        phenotype_type,
+        "_Youden_cutoff.pdf"
+      ),
+      width = 1.5 * 1.2,
+      height = 2.7 * 0.95,
+      phenotype_type = phenotype_type
+    )
+  }
+}
+
+```
+
+
 
 
 # Prepare CyTOF and Olink data
 ```{r}
-HCI002_filtered_info <- HCI002_all_info[61:25932]
+HCI002_filtered_info <- HCI002_all_info[20:25891]
 feature_names <- colnames(HCI002_filtered_info)
 
 CyTOF_baseline_data <- extract_cytof(HCI002_filtered_info, feature_names, "FC_baseline")
@@ -336,7 +378,7 @@ OLINK_FC_data <- extract_olink(
 
 ```
 
-# SFigure 1c,d. Within-modality correlation heatmaps.
+# SFigure 4C,D. Within-modality correlation heatmaps.
 ```{r}
 cytof_markers <- c(
   "T_CELL", "GDT", "B_CELL", "B_NAIVE", "B_MEM", "PB", "NK", "MONO", "DC",
@@ -426,7 +468,7 @@ common_gene <- intersect(genes_in_cluster1$Pre, genes_in_cluster1$On)
 
 ```
 
-# SFigure 6h (upper). Venn plot.
+# SFigure 10H (upper). Venn plot.
 ```{r}
 venn_plot <- draw.pairwise.venn(
   area1 = length(genes_in_cluster1$Pre),
@@ -449,7 +491,7 @@ save_pdf(
 
 ```
 
-# SFigure 6h (lower). AUCs for common proteins.
+# SFigure 10H (lower). AUCs for common proteins.
 ```{r}
 phenotype_vec <- HCI002_all_info$IRAEactionable01
 
@@ -499,7 +541,7 @@ save_pdf(
 
 ```
 
-# Figure 3d. CyTOF–Olink correlation heatmap.
+# Figure 3D. CyTOF–Olink correlation heatmap.
 ```{r}
 major_celltypes <- c(
   "T_CELL", "GDT", "B_CELL", "B_NAIVE", "B_MEM", "PB", "NK", "MONO", "DC",
@@ -567,9 +609,7 @@ save_pdf(
 
 ```
 
-
-
-# Figure 3e. AUC heatmap of baseline cytometric predictors across irAE subtypes
+# Figure 3E. AUC heatmap of baseline cytometric predictors across irAE subtypes
 ```{r}
 cytometry_predictors <- c(
   "CD8T_CM_tripletORp_ratio_pre",
@@ -638,7 +678,6 @@ compute_auc_pvalue <- function(df, outcome_col, predictor_col) {
   roc_p <- suppressMessages(
     pROC::roc.test(roc_obj, null_roc, method = "delong")$p.value
   )
-
   c(AUC = as.numeric(roc_obj$auc), p_value = roc_p)
 }
 
@@ -705,7 +744,7 @@ dev.off()
 
 ```
 
-# Figure 3f. Activated CD8Tcm abundance across irAE and ICB response groups in HCI002
+# Figure 3F. Activated CD8Tcm abundance across irAE and ICB response groups in HCI002
 ```{r}
 group_levels <- c("nsTOX,R", "nsTOX,NR", "sTOX,R", "sTOX,NR")
 
@@ -776,12 +815,10 @@ wilcox_results
 
 ```
 
-# Figure 3g/SFigure 4d,e,g. HCI002 survival analysis by cytometric predictors
+# Figure 3G/SFigure 6D,E. HCI002 survival analysis by cytometric predictors
 ```{r}
 feature_test_vec <- c(
-  "CD8T_CM_tripletORp_ratio_pre",
-  "CD4_TEM_FC_baselineL2"
-)
+  "CD8T_CM_tripletORp_ratio_pre")
 
 therapy_type_vec <- c("Active", "All", "Adjuvant")
 phenotype_str_vec <- c("OS", "PFS")
@@ -790,44 +827,6 @@ survival_labels <- c(
   OS = "Overall \nsurvival probability",
   PFS = "Progression-free \nsurvival probability"
 )
-
-survival_info_df <- readxl::read_excel(file.path(data_dir, "HCI002_clinical_info.xlsx")) %>%
-  select(
-    `Vial ID`,
-    `Record ID`,
-    `Systemic Therapy Name`,
-    `Systemic Therapy Type`,
-    OS_time,
-    OS_event,
-    PFS_time,
-    PFS_event
-  ) %>%
-  mutate(
-    uniqueID = paste0(
-      `Record ID`, "_",
-      `Systemic Therapy Name`, "_",
-      `Systemic Therapy Type`, "_",
-      `Vial ID`
-    ),
-    OS_time = OS_time / 30,
-    PFS_time = PFS_time / 30
-  )
-
-prepare_survival_data <- function(feature_col, therapy_type) {
-  predictor_df <- HCI002_all_info
-
-  if (therapy_type != "All") {
-    predictor_df <- predictor_df %>%
-      filter(TherapyType == therapy_type)
-  }
-
-  predictor_df %>%
-    select(`Vial ID`, patient_therapy, all_of(feature_col)) %>%
-    drop_na(all_of(feature_col)) %>%
-    mutate(uniqueID = paste0(patient_therapy, "_", `Vial ID`)) %>%
-    distinct(uniqueID, .keep_all = TRUE) %>%
-    merge(survival_info_df, by = "uniqueID", all.x = TRUE)
-}
 
 make_survival_group <- function(df, feature_col) {
   cutoff <- median(df[[feature_col]], na.rm = TRUE)
@@ -944,7 +943,12 @@ survival_results <- list()
 
 for (feature_col in feature_test_vec) {
   for (therapy_type in therapy_type_vec) {
-    survival_data <- prepare_survival_data(feature_col, therapy_type) %>%
+    survival_data <- HCI002_all_info
+    if (therapy_type != "All") {
+      survival_data <- survival_data %>%
+        filter(TherapyType == therapy_type)
+    }
+    survival_data <- survival_data %>%
       make_survival_group(feature_col)
 
     for (phenotype in phenotype_str_vec) {
@@ -967,307 +971,7 @@ survival_results
 ```
 
 
-
-# Helper functions
-```{r}
-format_p_value <- function(p) {
-  dplyr::case_when(
-    is.na(p) ~ NA_character_,
-    p >= 0.05 ~ as.character(round(p, 2)),
-    p >= 0.0095 ~ as.character(round(p, 3)),
-    TRUE ~ format(p, scientific = TRUE, digits = 2)
-  )
-}
-
-compute_auc_summary <- function(df, outcome_col, predictor_col) {
-  auc_df <- df %>%
-    select(outcome = all_of(outcome_col), predictor = all_of(predictor_col)) %>%
-    drop_na()
-
-  if (nrow(auc_df) < 5 || length(unique(auc_df$outcome)) < 2) {
-    return(tibble(AUC = NA_real_, AUC_low = NA_real_, AUC_high = NA_real_, p_value = NA_real_, n = nrow(auc_df)))
-  }
-
-  roc_obj <- pROC::roc(
-    response = auc_df$outcome,
-    predictor = auc_df$predictor,
-    direction = "<",
-    levels = c(0, 1),
-    quiet = TRUE
-  )
-
-  auc_ci <- pROC::ci.auc(roc_obj)
-
-  tibble(
-    AUC = as.numeric(auc_ci[2]),
-    AUC_low = as.numeric(auc_ci[1]),
-    AUC_high = as.numeric(auc_ci[3]),
-    p_value = verification::roc.area(auc_df$outcome, auc_df$predictor)$p.value,
-    n = nrow(auc_df)
-  )
-}
-
-save_auc_barplot <- function(plot_df, file_name, width = 2, height = 3.5) {
-  p <- ggplot(plot_df, aes(x = label, y = AUC, fill = label)) +
-    geom_col(width = 0.7) +
-    geom_errorbar(aes(ymin = AUC_low, ymax = AUC_high), width = 0.2, color = "black", linewidth = 0.5) +
-    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey", linewidth = 0.5) +
-    labs(x = NULL, y = "AUC") +
-    coord_cartesian(ylim = c(0, 1)) +
-    theme_classic() +
-    theme(
-      axis.text = element_text(color = "black"),
-      axis.text.x = element_text(angle = 47, hjust = 1),
-      legend.position = "none"
-    )
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = width, height = height)
-  print(p)
-  dev.off()
-}
-
-prepare_hci002_survival_data <- function(feature_col) {
-  predictor_df <- HCI002_all_info %>%
-    select(
-      `Vial ID`,
-      patient_therapy,
-      all_of(feature_col),
-      Gender,
-      `Age at C1`,
-      `ICI Naïve?`,
-      `Systemic Therapy Type`,
-      `Baseline Stage / TNM`,
-      `Duration of treatment`,
-      IRAEactionable01,
-      `Systemic Therapy Name`
-    ) %>%
-    mutate(
-      Sex = factor(ifelse(Gender == "Male", 1, 0), levels = c(0, 1)),
-      Age = `Age at C1`,
-      previousICB = factor(ifelse(`ICI Naïve?` == "Yes", 0, 1), levels = c(0, 1)),
-      activeICB = factor(ifelse(`Systemic Therapy Type` == "active treatment", 1, 0), levels = c(0, 1)),
-      Stage = factor(ifelse(grepl("Stage IV", `Baseline Stage / TNM`), 1, 0), levels = c(0, 1)),
-      ICBduration = `Duration of treatment`,
-      Drug = ifelse(
-        `Systemic Therapy Name` %in% c(
-          "Nivolumab/ Ipilimumab",
-          "PD1-CTLA4 bispecific",
-          "Ipi 10 / temozolomide",
-          "Nivolumab/ Ipilimumab flipped dose",
-          "Ipi 3 / temozolomide",
-          "Pembrolizumab / CTLA-4-LAG3 bispecific",
-          "CTLA-4-LAG3 bispecific",
-          "Pembrolizumab/ anti-CTLA4",
-          "anti-CTLA4"
-        ),
-        "CTLA4-containing",
-        "PD1/PDL1"
-      ),
-      uniqueID = paste0(patient_therapy, "_", `Vial ID`)
-    ) %>%
-    select(
-      uniqueID,
-      all_of(feature_col),
-      Sex,
-      Age,
-      previousICB,
-      activeICB,
-      Stage,
-      ICBduration,
-      IRAEactionable01,
-      Drug
-    ) %>%
-    drop_na() %>%
-    distinct(uniqueID, .keep_all = TRUE)
-
-  survival_info_df <- readxl::read_excel(file.path(data_dir, "HCI002_clinical_info.xlsx")) %>%
-    select(
-      `Vial ID`,
-      `Record ID`,
-      `Systemic Therapy Name`,
-      `Systemic Therapy Type`,
-      OS_time,
-      OS_event,
-      PFS_time,
-      PFS_event
-    ) %>%
-    mutate(
-      uniqueID = paste0(`Record ID`, "_", `Systemic Therapy Name`, "_", `Systemic Therapy Type`, "_", `Vial ID`),
-      OS_time = as.numeric(OS_time) / 30,
-      PFS_time = as.numeric(PFS_time) / 30,
-      OS_event = as.numeric(OS_event),
-      PFS_event = as.numeric(PFS_event)
-    )
-
-  merge(predictor_df, survival_info_df, by = "uniqueID", all.x = TRUE) %>%
-    filter(!is.na(.data[[feature_col]]))
-}
-
-fit_multivariable_cox <- function(df, feature_col, control_vars, outcome_prefix, cutoff = 0.04) {
-  model_df <- df %>%
-    mutate(
-      Score = factor(ifelse(.data[[feature_col]] > cutoff, "High", "Low"), levels = c("Low", "High"))
-    ) %>%
-    select(
-      Score,
-      all_of(control_vars),
-      time = all_of(paste0(outcome_prefix, "_time")),
-      event = all_of(paste0(outcome_prefix, "_event"))
-    ) %>%
-    drop_na()
-
-  model <- coxph(
-    as.formula(paste("Surv(time, event) ~ Score +", paste(control_vars, collapse = " + "))),
-    data = model_df
-  )
-
-  cox_sum <- summary(model)
-
-  tibble(
-    HR = cox_sum$coefficients[, 2],
-    HR_low = cox_sum$conf.int[, 3],
-    HR_high = cox_sum$conf.int[, 4],
-    p_value = cox_sum$coefficients[, 5]
-  )
-}
-
-save_forest_plot <- function(plot_data, file_name, x_label) {
-  plot_data <- plot_data %>%
-    mutate(
-      effSize = sprintf("%.3f", mean),
-      pval = format_p_value(pval)
-    )
-
-  fp <- forestplot(
-    plot_data,
-    labeltext = c(effSize, Variable, pval),
-    mean = mean,
-    lower = lower,
-    upper = upper,
-    graph.pos = 3,
-    boxsize = 0.25,
-    vertices = TRUE,
-    clip = c(0, 4),
-    xlog = FALSE,
-    zero = 1,
-    txt_gp = fpTxtGp(
-      ticks = gpar(cex = 1.1),
-      xlab = gpar(cex = 1.1),
-      label = gpar(cex = 1.1),
-      title = gpar(cex = 1.1)
-    ),
-    xlab = x_label,
-    xticks = c(0, 1, 2, 3),
-    graphwidth = unit(2.4, "cm"),
-    lineheight = unit(0.85, "cm")
-  ) %>%
-    fp_set_style(
-      box = "black",
-      line = "black",
-      align = "llr",
-      summary = "black"
-    ) %>%
-    fp_add_header(
-      effSize = "HR",
-      Variable = "Variable",
-      pval = "P-value"
-    )
-
-  pdf(file.path(result_figure_dir, file_name), onefile = FALSE, width = 5.5, height = 3.4)
-  print(fp)
-  dev.off()
-}
-
-save_km_plot <- function(df, feature_col, phenotype, cohort_name, xlim_max = 50) {
-  y_labels <- c(
-    OS = "Overall \nsurvival probability",
-    PFS = "Progression-free \nsurvival probability"
-  )
-
-  cutoff <- median(df[[feature_col]], na.rm = TRUE)
-
-  survival_df <- df %>%
-    mutate(
-      Score = factor(ifelse(.data[[feature_col]] > cutoff, "High", "Low"), levels = c("Low", "High"))
-    ) %>%
-    select(
-      Score,
-      time = all_of(paste0(phenotype, "_time")),
-      event = all_of(paste0(phenotype, "_event"))
-    ) %>%
-    drop_na()
-
-  surv_fit <- survfit(Surv(time, event) ~ Score, data = survival_df)
-  cox_fit <- coxph(Surv(time, event) ~ Score, data = survival_df)
-  cox_sum <- summary(cox_fit)
-
-  hr <- cox_sum$coefficients[2]
-  p_value <- cox_sum$coefficients[5]
-  hr_ci <- cox_sum$conf.int[3:4]
-
-  km_plot <- ggsurvplot(
-    surv_fit,
-    data = survival_df,
-    size = 1,
-    palette = c("#00305d", "#9c1915"),
-    conf.int = FALSE,
-    pval = FALSE,
-    xlim = c(-3, xlim_max),
-    ylim = c(0, 1),
-    xlab = "Time (months)",
-    ylab = y_labels[[phenotype]],
-    break.time.by = 10,
-    risk.table = TRUE,
-    risk.table.height = 0.25,
-    risk.table.pos = "out",
-    risk.table.col = "black",
-    risk.table.y.text = FALSE,
-    tables.y.text = FALSE,
-    tables.theme = theme_cleantable(),
-    legend.labs = c("Low", "High"),
-    legend.title = "",
-    legend = c(0.75, 0.975),
-    font.main = 12,
-    font.caption = 12,
-    font.legend = 12,
-    font.tickslab = 12,
-    font.x = 12,
-    font.y = 12,
-    ggtheme = theme(
-      legend.background = element_rect(fill = NA, color = NA),
-      legend.key = element_rect(fill = NA, color = NA),
-      plot.margin = unit(c(0.2, 0.2, 0, 0.2), "cm"),
-      panel.background = element_rect(fill = "white"),
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.border = element_blank(),
-      axis.line = element_line(color = "black"),
-      axis.text = element_text(color = "black")
-    )
-  )
-
-  km_plot$plot <- km_plot$plot +
-    annotate(
-      "text",
-      x = 0,
-      y = 0.15,
-      hjust = 0,
-      size = 5,
-      label = paste0(
-        "HR = ", round(hr, 2),
-        " (", round(hr_ci[1], 2), "-", round(hr_ci[2], 2), ")",
-        "\np = ", sprintf("%.3f", p_value)
-      )
-    )
-
-  pdf(file.path(result_figure_dir, paste0("KM_curve_", phenotype, "_", feature_col, "_", cohort_name, ".pdf")), width = 3.3, height = 3)
-  print(km_plot, newpage = FALSE)
-  dev.off()
-}
-```
-
-
-# Figure 3h. Multivariable Cox regression forest plots in HCI002
+# Figure 3H. Multivariable Cox regression forest plots in HCI002
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
@@ -1276,9 +980,8 @@ control_vars <- c(
   "Sex",
   "Stage",
   "Drug",
-  "previousICB",
-  "IRAEactionable01"
-)
+  "previousICB"
+  )
 
 variable_labels <- c(
   "Activated CD8Tcm",
@@ -1286,9 +989,8 @@ variable_labels <- c(
   "Sex (Female vs male)",
   "Stage (IV vs I-III)",
   "Drug (anti-PD(L)1 vs\n anti-CTLA4-containing)",
-  "Previous ICB therapy",
-  "Severe irAE"
-)
+  "Previous ICB therapy"
+  )
 
 hci002_survival_df <- prepare_hci002_survival_data(feature_col)
 
@@ -1345,53 +1047,12 @@ save_forest_plot(
 ```
 
 
-# SFigure 4f. HCI001 survival analysis by activated CD8Tcm abundance
-```{r}
-feature_col <- "CD8T_CM_tripletORp_ratio_pre"
-
-hci001_predictor_df <- HCI001_all_info %>%
-  select(`RedCap ID`, all_of(feature_col)) %>%
-  drop_na() %>%
-  distinct(`RedCap ID`, .keep_all = TRUE)
-
-hci001_survival_info <- readxl::read_excel(file.path(data_dir, "HCI001_clinical_info.xlsx")) %>%
-  select(`RedCap ID`, OS_time, OS_event, PFS_time, PFS_event) %>%
-  distinct(`RedCap ID`, .keep_all = TRUE) %>%
-  mutate(
-    OS_time = as.numeric(OS_time) / 30,
-    PFS_time = as.numeric(PFS_time) / 30,
-    OS_event = as.numeric(OS_event),
-    PFS_event = as.numeric(PFS_event)
-  )
-
-hci001_survival_df <- merge(
-  hci001_predictor_df,
-  hci001_survival_info,
-  by = "RedCap ID",
-  all.x = TRUE
-) %>%
-  filter(!is.na(.data[[feature_col]]))
-
-for (phenotype in c("PFS", "OS")) {
-  save_km_plot(
-    df = hci001_survival_df,
-    feature_col = feature_col,
-    phenotype = phenotype,
-    cohort_name = "HCI001",
-    xlim_max = 50
-  )
-}
-
-```
-
-
 # AUC summary across irAE definitions in HCI001 and HCI002
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
 irae_types <- c(
   "IRAEgrade01",
-  "minIRAEgrade01",
   "IRAEactionable01",
   "IRAE_GI01",
   "IRAE_HB01",
@@ -1418,7 +1079,7 @@ AUC_irAEs_df_HCI001 <- compute_irae_auc_table(HCI001_all_info, feature_col, irae
 ```
 
 
-# SFigure 4a. AUC comparison across irAE subtypes
+# SFigure 6A. AUC comparison across irAE subtypes
 ```{r}
 irae_label_map <- c(
   IRAE_GI01 = "Gastrointestinal",
@@ -1451,7 +1112,7 @@ for (dataset_name in names(auc_dataset_list)) {
 
 ```
 
-# SFigure 4c. Association between activated CD8Tcm abundance and baseline clinical variables in HCI002
+# SFigure 6C. Association between activated CD8Tcm abundance and baseline clinical variables in HCI002
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 feature_label <- "% activated CD8Tcm"
@@ -1538,7 +1199,7 @@ wilcox_results
 
 ```
 
-# SFigure 4b. AUC comparison across clinical subgroups in HCI002
+# SFigure 6B. AUC comparison across clinical subgroups in HCI002
 ```{r}
 feature_col <- "CD8T_CM_tripletORp_ratio_pre"
 
@@ -1590,5 +1251,635 @@ for (group_col in names(subgroup_specs)) {
 
 ```
 
+# SFigure 7A.
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+marker_patient_level_expr_df <- read.csv(paste0(data_dir, "HCI002_marker_median_expr_patient_level_CD8Tcm.csv"), row.names = 1)
+
+marker_cell_level_expr_df <- read.csv(
+    paste0(data_dir, "HCI002_marker_median_expr_cell_level.csv"),
+    row.names = 1
+)
+marker_cell_level_expr_df$LAG3 <- NULL
+marker_cell_level_expr_df$CD57 <- NULL
+marker_cell_level_expr_df$CTLA4 <- NULL
+marker_cell_level_expr_df$CD25 <- NULL
+marker_cell_level_expr_df$TIM3 <- NULL
+
+fc <- as.numeric(marker_cell_level_expr_df["activated_CD8T_CM", ] /
+      marker_cell_level_expr_df["inactivated_CD8T_CM", ])
+
+marker_cell_level_expr_df <- marker_cell_level_expr_df[
+    ,
+    order(fc, decreasing = TRUE),
+    drop = FALSE
+]
+
+fc[order(fc, decreasing = TRUE)]
+
+z_expr <- scale(marker_cell_level_expr_df)
+
+z_expr <- z_expr[
+    ,
+    apply(z_expr, 2, function(x) all(is.finite(x))),
+    drop = FALSE
+]
+
+z_expr[z_expr > 2]  <- 2
+z_expr[z_expr < -2] <- -2
+
+rownames(z_expr) <- c(
+    "Activated CD8 TCM",
+    "Inactivated CD8 TCM",
+    "Overall CD8 T",
+    "Overall T",
+    "All cells"
+)
+
+col_fun <- colorRamp2(
+    c(-2, 0, 2),
+    c("#2166AC", "white", "#B2182B")
+)
+
+ht <- Heatmap(
+    z_expr,
+    name = "Z-score",
+    col = col_fun,
+
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+
+    show_row_dend = FALSE,
+    show_column_dend = FALSE,
+
+    row_names_side = "left",
+    row_names_gp = grid::gpar(fontsize = 10),
+
+    column_names_rot = 45,
+    column_names_gp = grid::gpar(fontsize = 9),
+
+    rect_gp = grid::gpar(
+        col = "white",
+        lwd = 1
+    ),
+
+    heatmap_legend_param = list(
+        title = "Z-score",
+        at = c(-2, -1, 0, 1, 2),
+        direction = "vertical"
+    ),
+
+    border = TRUE
+)
+
+pdf(
+    paste0(
+        result_figure_dir,
+        "activated_CD8T_CM_state_heatmap.pdf"
+    ),
+    width = 9*0.5,
+    height = 4.2*0.4,
+    useDingbats = FALSE
+)
+
+draw(
+    ht,
+    heatmap_legend_side = "right"
+)
+
+dev.off()
+
+
+##### patient level paired 
+markers_to_plot <- c("CD39", "ICOS", "PD1", "TIGIT")
+
+font_size <- 10
+
+for (marker in markers_to_plot) {
+
+    act_col   <- paste0(marker, "_activated")
+    inact_col <- paste0(marker, "_inactivated")
+
+    df <- marker_patient_level_expr_df[
+        complete.cases(
+            marker_patient_level_expr_df[, c(act_col, inact_col)]
+        ),
+        c("Patient_ID", act_col, inact_col)
+    ]
+
+    plot_df <- rbind(
+        data.frame(
+            Patient_ID = df$Patient_ID,
+            Group = "Inactivated",
+            Expression = df[[inact_col]]
+        ),
+        data.frame(
+            Patient_ID = df$Patient_ID,
+            Group = "Activated",
+            Expression = df[[act_col]]
+        )
+    )
+
+    plot_df$Group <- factor(
+        plot_df$Group,
+        levels = c("Inactivated", "Activated")
+    )
+
+    pval <- wilcox.test(
+        df[[inact_col]],
+        df[[act_col]],
+        paired = TRUE,
+        exact = FALSE
+    )$p.value
+
+    p_label <- paste0(
+        "P = ",
+        format(
+            pval,
+            scientific = TRUE,
+            digits = 2
+        )
+    )
+
+    p_label <- gsub("e-0", "e-", p_label)
+    p_label <- gsub("e\\+0", "e+", p_label)
+
+    y_max <- max(plot_df$Expression, na.rm = TRUE)
+    y_min <- min(plot_df$Expression, na.rm = TRUE)
+    y_range <- y_max - y_min
+
+    p_y <- y_max + 0.08 * y_range
+
+    p <- ggplot(
+        plot_df,
+        aes(
+            x = Group,
+            y = Expression,
+            group = Patient_ID
+        )
+    ) +
+        geom_line(
+            color = "grey75",
+            linewidth = 0.4,
+            alpha = 0.65
+        ) +
+        geom_boxplot(
+            aes(group = Group),
+            width = 0.42,
+            outlier.shape = NA,
+            fill = "white",
+            color = "black",
+            linewidth = 0.7
+        ) +
+        geom_point(
+            size = 1.7,
+            color = "#377EB8",
+            alpha = 0.45,
+            position = position_jitter(width = 0.06, height = 0)
+        ) +
+        annotate(
+            "text",
+            x = 1.5,
+            y = p_y,
+            label = p_label,
+            size = font_size / ggplot2::.pt
+        ) +
+        labs(
+            x = NULL,
+            y = paste0(marker, " expression"),
+            title = marker
+        ) +
+        scale_y_continuous(
+            expand = expansion(
+                mult = c(0.03, 0.15)
+            )
+        ) +
+        theme_classic(base_size = font_size) +
+        theme(
+            # Same font size everywhere
+            plot.title = element_text(
+                size = font_size,
+                face = "plain",
+                hjust = 0.5
+            ),
+            axis.title = element_text(
+                size = font_size,
+                face = "plain"
+            ),
+            axis.text = element_text(
+                size = font_size,
+                color = "black"
+            ),
+            axis.text.x = element_text(
+                angle = 45,
+                hjust = 1
+            ),
+            axis.line = element_line(
+                linewidth = 0.6
+            ),
+            axis.ticks = element_line(
+                linewidth = 0.5
+            )
+        )
+
+    ggsave(
+        filename = paste0(
+            result_figure_dir,
+            marker,
+            "_activated_vs_inactivated_CD8TCM.pdf"
+        ),
+        plot = p,
+        width = 3.2*0.5,
+        height = 4.0*0.8,
+        units = "in",
+        useDingbats = FALSE
+    )
+}
+
+```
+
+# SFigure 7B.
+```{r}
+
+HCI002_all_info <- read_csv(
+  file.path(data_dir, "HCI002_all_info.csv"),
+  name_repair = "minimal",
+  show_col_types = FALSE
+)
+HCI002_map_df <- read.csv(file.path(data_dir, "HCI002_OlinkID_ProteinName_map.csv"))
+proteins_mapping <- setNames(HCI002_map_df$Assay, HCI002_map_df$OlinkID)
+HCI002_data <- read.csv(file.path(data_dir, "/merged_cohorts/HCI002_info_save.csv"), stringsAsFactors = FALSE)
+HCI002_all_info <- HCI002_all_info %>%
+  merge(
+    HCI002_data[, c("patient_therapy", setdiff(colnames(HCI002_data), colnames(HCI002_all_info)))],
+    by = "patient_therapy",
+    all.x = TRUE
+  )
+
+old_names <- colnames(HCI002_all_info)
+oid <- sub("^(OID[0-9]+).*", "\\1", old_names)
+matched <- oid %in% names(proteins_mapping)
+new_names <- old_names
+new_names[matched] <- paste0(
+    proteins_mapping[oid[matched]],
+    sub("^OID[0-9]+_OLINK", "", old_names[matched])
+)
+colnames(HCI002_all_info) <- new_names
+
+x <- HCI002_all_info$CD8T_CM_tripletORp_ratio_pre
+OLINK_proteins <- as.character(proteins_mapping)
+
+cor_results <- do.call(
+    rbind,
+    lapply(OLINK_proteins, function(protein) {
+
+        var_test <- paste0(protein, "_FC_on_pre")
+
+        if (!var_test %in% colnames(HCI002_all_info)) {
+            return(
+                data.frame(
+                    protein = protein,
+                    SCC = NA_real_,
+                    pval = NA_real_,
+                    n = 0
+                )
+            )
+        }
+
+        y <- HCI002_all_info[[var_test]]
+        keep <- complete.cases(x, y)
+
+        if (sum(keep) < 3) {
+            return(
+                data.frame(
+                    protein = protein,
+                    SCC = NA_real_,
+                    pval = NA_real_,
+                    n = sum(keep)
+                )
+            )
+        }
+
+        test <- suppressWarnings(
+            cor.test(
+                x[keep],
+                y[keep],
+                method = "spearman",
+                exact = FALSE
+            )
+        )
+
+        data.frame(
+            protein = protein,
+            SCC = unname(test$estimate),
+            pval = test$p.value,
+            n = sum(keep)
+        )
+    })
+)
+
+rownames(cor_results) <- NULL
+
+cor_results <- cor_results[
+    order(-cor_results$SCC),
+]
+
+cor_results <- na.omit(cor_results)
+
+head(cor_results, 50)
+
+top_hits <- c(
+  "CXCL9", "CXCL10", "CXCL11", "CXCL13",
+  "IL17A", "XCL1", "CCL3", "IL18",
+  "CD70", "WARS", "TIGIT", "GBP1"
+)
+
+plot_df <- cor_results %>%
+  dplyr::mutate(
+    neglog10P = -log10(pmax(pval, .Machine$double.xmin)),
+    significance = ifelse(pval < 0.05, "P < 0.05", "P ≥ 0.05")
+  )
+
+# Inspect selected proteins
+plot_df %>%
+  dplyr::filter(.data$protein %in% top_hits) %>%
+  dplyr::arrange(.data$pval) %>%
+  dplyr::select(protein, SCC, pval, n)
+
+p <- ggplot(
+  plot_df,
+  aes(x = SCC, y = neglog10P)
+) +
+
+  # All proteins
+  geom_point(
+    aes(color = significance),
+    size = 1.8,
+    alpha = 0.65
+  ) +
+
+  # P = 0.05 threshold
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+
+  # SCC = 0 reference
+  geom_vline(
+    xintercept = 0,
+    linetype = "dotted",
+    linewidth = 0.4
+  ) +
+
+  # Highlight selected biologically meaningful proteins
+  geom_point(
+    data = plot_df %>%
+      dplyr::filter(.data$protein %in% top_hits),
+    size = 2.7,
+    shape = 21,
+    stroke = 0.8
+  ) +
+
+  # Labels
+  geom_text_repel(
+    data = plot_df %>%
+      dplyr::filter(.data$protein %in% top_hits),
+    aes(label = protein),
+    size = 4,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    min.segment.length = 0,
+    segment.size = 0.35,
+    max.overlaps = Inf,
+    seed = 123
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "P ≥ 0.05" = "grey75",
+      "P < 0.05" = "#C43C39"
+    )
+  ) +
+
+  labs(
+    x = "Spearman correlation coefficient",
+    y = expression(-log[10](P)),
+    color = NULL
+  ) +
+
+  theme_classic(base_size = 14) +
+
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.position = "top",
+    legend.justification = "left",
+    axis.line = element_line(linewidth = 0.6),
+    axis.ticks = element_line(linewidth = 0.6),
+    plot.margin = margin(8, 15, 8, 8)
+  )
+
+ggsave(
+  paste0(result_figure_dir, "aCD8Tcm_olink_SCC_volcano.pdf"),
+  plot = p,
+  width = 6.5*0.8,
+  height = 5.5*0.8,
+  device = "pdf"
+)
+
+
+
+
+## ranked-proteome GSEA
+gsea_df <- cor_results %>%
+  dplyr::filter(
+    !is.na(SCC),
+    is.finite(SCC),
+    !is.na(protein),
+    protein != ""
+  ) %>%
+  dplyr::arrange(desc(abs(SCC))) %>%
+  dplyr::distinct(protein, .keep_all = TRUE)
+
+# Positive SCC -> positive NES
+# Negative SCC -> negative NES
+ranks <- gsea_df$SCC
+names(ranks) <- gsea_df$protein
+ranks <- sort(ranks, decreasing = TRUE)
+
+stopifnot(
+  all(is.finite(ranks)),
+  !anyDuplicated(names(ranks)),
+  all(diff(ranks) <= 0)
+)
+
+
+hallmark_df <- msigdbr(
+  species = "Homo sapiens",
+  collection = "H"
+)
+
+hallmark_pathways <- split(
+  hallmark_df$gene_symbol,
+  hallmark_df$gs_name
+)
+
+set.seed(123)
+
+fgsea_hallmark <- fgseaMultilevel(
+  pathways = hallmark_pathways,
+  stats = ranks,
+  minSize = 10,
+  maxSize = 500,
+  scoreType = "std",
+  eps = 0
+)
+
+fgsea_hallmark <- as.data.frame(fgsea_hallmark) %>%
+  dplyr::arrange(pval)
+
+clean_hallmark_name <- function(x) {
+
+  x %>%
+    stringr::str_remove("^HALLMARK_") %>%
+    stringr::str_replace_all("_", " ") %>%
+    stringr::str_to_lower() %>%
+    stringr::str_to_title() %>%
+
+    # Improve common biological abbreviations
+    stringr::str_replace_all("Ifn ", "IFN-") %>%
+    stringr::str_replace_all("Il2 Stat5", "IL2/STAT5") %>%
+    stringr::str_replace_all("Il6 Jak Stat3", "IL6/JAK/STAT3") %>%
+    stringr::str_replace_all("Tnfa Signaling Via Nfkb",
+                             "TNFA signaling via NF-kB") %>%
+    stringr::str_replace_all("Pi3k Akt Mtor",
+                             "PI3K/AKT/mTOR") %>%
+    stringr::str_replace_all("Mtorc1", "mTORC1") %>%
+    stringr::str_replace_all("G2m", "G2M") %>%
+    stringr::str_replace_all("E2f", "E2F") %>%
+    stringr::str_replace_all("Myc", "MYC") %>%
+    stringr::str_replace_all("P53", "p53") %>%
+    stringr::str_replace_all("Kras", "KRAS") %>%
+    stringr::str_replace_all("Tgf Beta", "TGF-beta") %>%
+    stringr::str_replace_all("Wnt Beta Catenin",
+                             "WNT-beta-catenin")
+}
+
+fgsea_hallmark <- fgsea_hallmark %>%
+  dplyr::mutate(
+    Description = clean_hallmark_name(pathway)
+  )
+
+
+plot_df <- fgsea_hallmark %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::mutate(
+    neglog10_padj = -log10(padj)
+  ) %>%
+  dplyr::arrange(neglog10_padj) %>%
+  dplyr::mutate(
+    Description = factor(
+      Description,
+      levels = Description
+    )
+  )
+
+p_gsea <- ggplot(
+  plot_df,
+  aes(
+    x = neglog10_padj,
+    y = Description,
+    fill = NES
+  )
+) +
+
+  geom_col(
+    width = 0.72
+  ) +
+
+  # FDR = 0.05 reference
+  geom_vline(
+    xintercept = -log10(0.05),
+    linetype = "dashed",
+    linewidth = 0.5,
+    color = "grey40"
+  ) +
+
+  # Diverging NES color scale
+  scale_fill_gradient2(
+    low = "#3C6FA8",
+    mid = "white",
+    high = "#C94F4F",
+    midpoint = 0,
+    name = "NES"
+  ) +
+
+  labs(
+    x = expression(-log[10]("p.adjust")),
+    y = NULL
+  ) +
+
+  theme_classic(base_size = 10) +
+
+  theme(
+    panel.grid = element_blank(),
+
+    axis.line.y = element_blank(),
+    axis.line.x = element_line(
+      color = "black",
+      linewidth = 0.5
+    ),
+
+    axis.ticks.y = element_blank(),
+
+    axis.text = element_text(
+      color = "black",
+      size = 9
+    ),
+
+    axis.text.y = element_text(
+      size = 9,
+      lineheight = 0.9
+    ),
+
+    axis.title.x = element_text(
+      size = 10,
+      margin = margin(t = 6)
+    ),
+
+    legend.position = "right",
+
+    legend.title = element_text(
+      size = 9
+    ),
+
+    legend.text = element_text(
+      size = 8
+    ),
+
+    plot.margin = margin(
+      t = 5,
+      r = 5,
+      b = 5,
+      l = 5
+    )
+  )
+
+ggsave(
+  filename = file.path(
+    result_figure_dir,
+    "aCD8Tcm_olink_Hallmark_GSEA.pdf"
+  ),
+  plot = p_gsea,
+  width = 5.2 * 0.9,
+  height = max(3.0, 0.25 * nrow(plot_df) + 1.2) * 0.9,
+  device = "pdf"
+)
+
+```
 
 

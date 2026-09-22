@@ -1,6 +1,6 @@
 ---
 title: "Predict severe irAEs with blood cytometric and proteomic data"
-author: "Tiangen Chang <tiangen.chang@nih.gov>"
+author: "Tiangen Chang <tiangen.chang@sjtu.edu.cn>"
 output:
   rmarkdown::html_vignette:
     toc: true
@@ -13,253 +13,26 @@ vignette: >
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, results = "markup", message = FALSE, warning = FALSE)
+source("utils.R")
 ```
 
 
 ####### This script makes the below displays for the paper
-## Figure 2a-f
-## Figure 4a,b
-## SFigure 2a-d
-## SFigure 6a-g
-## STable 6
+## Figure 2
+## Figure 4A,B
+## SFigure 5A-D
+## SFigure 10A-G
+## STable 8
 
-# Package Loading
-```{r}
-library(AnnotationDbi)
-library(circlize)
-library(clusterProfiler)
-library(ComplexHeatmap)
-library(dplyr)
-library(enrichplot)
-library(ggplot2)
-library(ggpubr)
-library(ggrepel)
-library(grid)
-library(msigdbr)
-library(openxlsx)
-library(org.Hs.eg.db)
-library(pROC)
-library(readr)
-library(readxl)
-library(tidyr)
-library(VennDiagram)
-```
-
-# Parameters and shared functions
-```{r}
-result_figure_dir <- "Figures"
-data_dir <- "SourceData"
-
-fig_path <- function(...) file.path(result_figure_dir, paste0(...))
-data_path <- function(...) file.path(data_dir, paste0(...))
-
-p_to_symbol <- function(p) {
-  dplyr::case_when(
-    is.na(p) ~ "ns",
-    p < 0.001 ~ "***",
-    p < 0.01 ~ "**",
-    p < 0.05 ~ "*",
-    TRUE ~ "ns"
-  )
-}
-
-convert_gene_ids_to_symbols <- function(gene_ids, mapping) {
-  vapply(gene_ids, function(x) {
-    entrez_ids <- unlist(strsplit(x, "/"))
-    paste(names(mapping)[match(entrez_ids, mapping)], collapse = ", ")
-  }, character(1))
-}
-
-convert_label_genes <- function(label_genes) {
-  label <- vapply(label_genes, function(x) {
-    parts <- unlist(strsplit(x, " > "))
-    marker <- ifelse(
-      grepl("neg$", parts[2]),
-      gsub("_", "+", parts[2]),
-      paste0(gsub("_", "+", parts[2]), "+")
-    )
-    paste(marker, gsub("_", "", parts[1]))
-  }, character(1))
-
-  replacements <- c(
-    TCM = "Tcm", TEMRA = "Temra", TEM = "Tem", NAIVE = "naive",
-    TFH = "Tfh", MONO = "Mono", TSCM = "Tscm", TREG = "Treg", BREG = "Breg"
-  )
-
-  label <- gsub("^NA\\+\\s*", "", label)
-  label <- gsub("neg", "-", label)
-
-  for (old in names(replacements)) {
-    label <- gsub(old, replacements[[old]], label)
-  }
-
-  label
-}
-
-prepare_feature_table <- function(result_df, time_point, modality, map_df) {
-  out <- result_df[grepl(time_point, rownames(result_df)), , drop = FALSE]
-
-  if (modality == "flow") {
-    out <- out[!grepl("_OLINK_", rownames(out)), , drop = FALSE]
-    out$Feature <- sub("_FC.*", "", rownames(out))
-    return(out)
-  }
-
-  out <- out[grepl("_OLINK_", rownames(out)), , drop = FALSE]
-  out$Feature <- sub("_OLINK.*", "", rownames(out))
-
-  map_df <- map_df |>
-    dplyr::transmute(
-      Feature = as.character(OlinkID),
-      GeneSymbol = as.character(Assay)
-    )
-
-  out <- merge(out, map_df, by = "Feature", all.x = TRUE, sort = FALSE)
-  out$OlinkID <- out$Feature
-  out$Feature <- out$GeneSymbol
-  out$GeneSymbol <- NULL
-  out[!duplicated(out$Feature), , drop = FALSE]
-}
-
-plot_venn_three_sets <- function(vec1, vec2, vec3, fig_name) {
-  venn_plot <- venn.diagram(
-    x = list(AUC = vec1, `Odds ratio` = vec2, `Fold change` = vec3),
-    filename = NULL,
-    output = TRUE,
-    log.filename = NULL,
-    imagetype = "pdf",
-    compression = "lzw",
-    fill = c("#E41A1C", "#377EB8", "#4DAF4A"),
-    alpha = 0.5,
-    cat.names = NULL,
-    cat.cex = 0,
-    cat.pos = 0,
-    cex = 1.5,
-    fontfamily = "sans",
-    cat.fontfamily = "sans",
-    cat.dist = 0.05
-  )
-
-  pdf(fig_name, width = 3.5, height = 3.5)
-  grid.draw(venn_plot)
-  dev.off()
-}
-
-plot_cell_boxplots <- function(
-  df,
-  cell_pattern,
-  cell_display_name,
-  ymax = 2,
-  ylabel_height = 1.7,
-  ytickstep = 0.5,
-  labeltextadd = 0.25,
-  phenotype = "Severe irAE"
-) {
-  phenotype_col <- dplyr::case_when(
-    phenotype == "Severe irAE" ~ "IRAEactionable01",
-    phenotype == "Response" ~ "Response01",
-    TRUE ~ NA_character_
-  )
-
-  if (is.na(phenotype_col)) {
-    stop("phenotype must be either 'Severe irAE' or 'Response'.")
-  }
-
-  required_cols <- c(
-    paste0(cell_pattern, c("baseline", "ontreat", "FC_on_pre")),
-    phenotype_col
-  )
-
-  missing_cols <- setdiff(required_cols, colnames(df))
-  if (length(missing_cols) > 0) {
-    stop("Missing columns: ", paste(missing_cols, collapse = ", "))
-  }
-
-  plot_df <- data.frame(
-    Pre = df[[paste0(cell_pattern, "baseline")]] / 100,
-    On = df[[paste0(cell_pattern, "ontreat")]] / 100,
-    FC = df[[paste0(cell_pattern, "FC_on_pre")]],
-    Phenotype = factor(df[[phenotype_col]])
-  ) |>
-    tidyr::pivot_longer(
-      cols = c("Pre", "On", "FC"),
-      names_to = "Group",
-      values_to = "Value"
-    ) |>
-    tidyr::drop_na() |>
-    dplyr::mutate(
-      Group = factor(Group, levels = c("Pre", "On", "FC")),
-      Combo = interaction(Group, Phenotype, sep = "."),
-      Combo = factor(Combo, levels = c("Pre.0", "Pre.1", "On.0", "On.1", "FC.0", "FC.1")),
-      x_pos = as.numeric(Combo)
-    )
-
-  comparisons <- list(c("Pre.0", "Pre.1"), c("On.0", "On.1"), c("FC.0", "FC.1"))
-
-  pvals <- vapply(comparisons, function(pair) {
-    data1 <- plot_df$Value[plot_df$Combo == pair[1]]
-    data2 <- plot_df$Value[plot_df$Combo == pair[2]]
-
-    if (length(data1) == 0 || length(data2) == 0) {
-      return(NA_real_)
-    }
-
-    tryCatch(
-      wilcox.test(data1, data2)$p.value,
-      error = function(e) NA_real_
-    )
-  }, numeric(1))
-
-  significance_labels <- p_to_symbol(pvals)
-  comparison_pairs <- list(c(1, 2), c(3, 4), c(5, 6))
-
-  p <- ggplot(plot_df, aes(x = x_pos, y = Value, fill = Phenotype, group = Combo)) +
-    geom_jitter(width = 0.15, size = 0.5, alpha = 0.7) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
-    scale_x_continuous(
-      breaks = c(1.5, 3.5, 5.5),
-      labels = c("Pre", "On", "FC"),
-      expand = expansion(add = 0.4)
-    ) +
-    scale_y_sqrt(breaks = seq(0, ymax, by = ytickstep)) +
-    scale_fill_manual(
-      values = c("0" = "#4E79A7", "1" = "#F28E2B"),
-      name = phenotype,
-      labels = c("No", "Yes")
-    ) +
-    coord_cartesian(ylim = c(0, ymax)) +
-    labs(title = cell_display_name, x = NULL, y = NULL) +
-    theme_classic(base_size = 12) +
-    theme(
-      plot.title = element_text(size = 9, hjust = 0.5),
-      axis.text = element_text(color = "black")
-    )
-
-  for (i in seq_along(comparison_pairs)) {
-    pair <- comparison_pairs[[i]]
-
-    p <- p +
-      annotate("segment", x = pair[1], xend = pair[2], y = ylabel_height, yend = ylabel_height, linewidth = 0.5) +
-      annotate("segment", x = pair[1], xend = pair[1], y = ylabel_height, yend = ylabel_height - 0.04, linewidth = 0.4) +
-      annotate("segment", x = pair[2], xend = pair[2], y = ylabel_height, yend = ylabel_height - 0.04, linewidth = 0.4) +
-      annotate("text", x = mean(pair), y = ylabel_height + labeltextadd, label = significance_labels[i])
-  }
-
-  p
-}
-
-```
 
 # Load data 
 ```{r}
 HCI002_all_info <- read_csv(data_path("HCI002_all_info.csv"), name_repair = "minimal")
 HCI002_map_df <- read.csv(data_path("HCI002_OlinkID_ProteinName_map.csv"))
 
-HCI001_all_info <- read_csv(data_path("HCI001_all_info.csv"), name_repair = "minimal")
-HCI001_map_df <- read.csv(data_path("HCI001_OlinkID_ProteinName_map.csv"))
 ```
 
-# SFigure 2a-d. Box plots.
+# SFigure 5A-D. Box plots.
 ```{r}
 phenotype_grouping <- "IRAEactionable01"
 
@@ -377,7 +150,7 @@ for (population_name in names(cell_population_specs)) {
   )
 
   ggsave(
-    fig_path(population_name, "_boxplots_vs_", phenotype_grouping, "_HCI002.pdf"),
+    fig_path(paste0(population_name, "_boxplots_vs_", phenotype_grouping, "_HCI002.pdf")),
     combined_plot,
     width = 13,
     height = ceiling(length(plot_list) / 6) * 1.95,
@@ -388,10 +161,10 @@ for (population_name in names(cell_population_specs)) {
 
 ```
 
-# Supplementary Table 6. 
+# Supplementary Table 8. 
 ```{r} 
 phenotype_name <- "IRAEactionable01"
-feature_df <- HCI002_all_info[61:25932]
+feature_df <- HCI002_all_info[20:25891]
 feature_names <- colnames(feature_df)
 phenotype <- HCI002_all_info[[phenotype_name]]
 
@@ -450,7 +223,7 @@ colnames(HCI002_result_df) <- result_columns
 HCI002_result_df2 <- HCI002_result_df[!grepl("IGG4|ABS$", rownames(HCI002_result_df)), ]
 write.csv(
   HCI002_result_df2,
-  file = data_path("HCI002_", phenotype_name, "_AUC_OddsRatio_FoldChange.csv")
+  file = data_path(paste0("HCI002_", phenotype_name, "_AUC_OddsRatio_FoldChange.csv"))
 )
 
 extract_ranked_results <- function(result_df, pattern, name_pattern) {
@@ -468,11 +241,11 @@ df_list <- list(
   OLINK_ontreatment = extract_ranked_results(HCI002_result_df2, "OLINK_ontreat", "_OLINK.*$")
 )
 
-write.xlsx(df_list, file = data_path("TableS6.xlsx"), rowNames = TRUE)
+write.xlsx(df_list, file = data_path("TableS8.xlsx"), rowNames = TRUE)
 
 ```
 
-# Figure 2a,c,e/SFigure 6a,c,e. Volcano plots.
+# Figure 2A,C,E/SFigure 10A,C,E. Volcano plots.
 ```{r}
 plot_volcano_panel <- function(result_df, phenotype_name, metric, time_point, modality, map_df, ymax = 10, seed = 1) {
   metric_col <- paste0(phenotype_name, "_", metric)
@@ -572,7 +345,7 @@ for (phenotype_name in phenotype_names_vec) {
       )
 
       pdf(
-        fig_path("Volcano_plot_HCI002_", phenotype_name, "_", metric_test_suffix, "_", timePt, "_", data_modality, ".pdf"),
+        fig_path(paste0("Volcano_plot_HCI002_", phenotype_name, "_", metric_test_suffix, "_", timePt, "_", data_modality, ".pdf")),
         width = 3.5,
         height = 3.85
       )
@@ -584,7 +357,7 @@ for (phenotype_name in phenotype_names_vec) {
 
 ```
 
-# Figure 2b,d,f/Figure 4a/SFigure 6b,d,f. Venn plots.
+# Figure 2B,D,F/Figure 4A/SFigure 10B,D,F. Venn plots.
 ```{r}
 
 phenotype_name <- "IRAEactionable01"
@@ -597,7 +370,7 @@ thresholds <- list(
 )
 
 HCI002_result_df <- read.csv(
-  data_path("HCI002_", phenotype_name, "_AUC_OddsRatio_FoldChange.csv"),
+  data_path(paste0("HCI002_", phenotype_name, "_AUC_OddsRatio_FoldChange.csv")),
   row.names = 1
 )
 
@@ -656,8 +429,8 @@ for (time_point in names(venn_results)) {
     res$pos$OR,
     res$pos$FC,
     fig_name = fig_path(
-      "Venn_Features_HCI002_", data_modality, "_", phenotype_name,
-      "_Positive_", time_point, ".pdf"
+      paste0("Venn_Features_HCI002_", data_modality, "_", phenotype_name,
+      "_Positive_", time_point, ".pdf")
     )
   )
 
@@ -666,8 +439,8 @@ for (time_point in names(venn_results)) {
     res$neg$OR,
     res$neg$FC,
     fig_name = fig_path(
-      "Venn_Features_HCI002_", data_modality, "_", phenotype_name,
-      "_Negative_", time_point, ".pdf"
+      paste0("Venn_Features_HCI002_", data_modality, "_", phenotype_name,
+      "_Negative_", time_point, ".pdf")
     )
   )
 }
@@ -681,7 +454,7 @@ Feature_neg_FC_on_pre_common <- venn_results$FC_on_pre$neg_common
 
 ```
 
-# Figure 4b/SFigure 6g. Pathway enrichment plots.
+# Figure 4B/SFigure 10G. Pathway enrichment plots.
 ```{r}
 get_enrichment_df <- function(enrich_result, id_map, pathway_map = NULL, direction = "Positive") {
   result <- enrich_result@result
@@ -720,6 +493,12 @@ olink_proteins_neg <- na.omit(Reduce(union, list(
 
 olink_proteins_pos_ids <- mapIds(org.Hs.eg.db, keys = olink_proteins_pos, column = "ENTREZID", keytype = "SYMBOL")
 olink_proteins_neg_ids <- mapIds(org.Hs.eg.db, keys = olink_proteins_neg, column = "ENTREZID", keytype = "SYMBOL")
+
+# use proxy if needed
+Sys.setenv(
+  https_proxy="http://127.0.0.1:7897",
+  http_proxy="http://127.0.0.1:7897"
+)
 
 msigdb <- msigdbr(species = "Homo sapiens", category = "H")
 msigdbr_t2g <- msigdb |>
