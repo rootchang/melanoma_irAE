@@ -14,7 +14,6 @@ vignette: >
 ####### This script makes the below displays for the paper
 ## Figure 3A,B,D-H
 ## SFigure 4C,D
-## SFigure 14A (left)
 ## SFigure 6A-E
 ## SFigure 7
 ## SFigure 8
